@@ -1,4 +1,4 @@
-"""V4 策略入口：时空路径协同——预测到达时间，冲突时减速/爬行错峰。"""
+"""V4 策略入口：拥堵感知路径——带节点/边惩罚的 Dijkstra 绕行。"""
 
 import os
 import sys
@@ -19,6 +19,6 @@ def my_strategy(state):
 
 
 if __name__ == "__main__":
-    print("=== V4 时空路径协同策略 ===")
+    print("=== V4 拥堵感知路径策略 ===")
     print("连接到:", SERVER_URL)
     sdk.run(my_strategy)

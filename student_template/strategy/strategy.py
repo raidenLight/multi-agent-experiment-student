@@ -344,11 +344,79 @@ class V3Strategy(V2Strategy):
 
 
 # ======================================================================
-# V4：目标错峰
+# V4：拥堵感知路径规划（带惩罚的 Dijkstra）
 # ======================================================================
 
 class V4Strategy(V3Strategy):
-    """V4：时空路径协同——估算到达时间，时间重叠的低优先级车减速/爬行错峰。"""
+    """V4：对车辆聚集的节点/边加惩罚权重，Dijkstra 自动绕开拥堵路段。"""
+
+    def _build_command(self, vehicle: dict, task: Task,
+                       ctx: dict = None) -> Optional[dict]:
+        if task.kind in (TaskKind.WAIT, TaskKind.ABANDON):
+            return super()._build_command(vehicle, task, ctx)
+
+        target_zone = task.target_zone
+        action_type = task.action_type
+        if not target_zone or not action_type:
+            return None
+
+        pos = vehicle.get("position")
+        if ctx:
+            penalties = self._build_node_penalties(ctx)
+            start = self.sdk.find_nearest_node(pos[0], pos[1])
+            end = self.sdk.get_zone_node(target_zone)
+            if start and end:
+                # 不对目标节点加惩罚，否则永远到不了
+                penalties.pop(end, None)
+                if penalties:
+                    path = self.sdk.plan_path_with_penalty(start, end, penalties)
+                    if path and len(path) > 1:
+                        return {
+                            "path": self.sdk.nodes_to_points(path),
+                            "action": {"type": action_type, "target_zone": target_zone},
+                            "speed": self.CRUISE_SPEED,
+                        }
+
+        return self.sdk.navigate_to(
+            target_zone,
+            action={"type": action_type, "target_zone": target_zone},
+            from_position=pos,
+            speed=self.CRUISE_SPEED,
+        )
+
+    def _build_node_penalties(self, ctx: dict) -> dict[str, float]:
+        """节点拥堵≥2车 +200；边占用（未来3个路径点）+30。"""
+        penalties: dict[str, float] = {}
+
+        # 节点拥堵惩罚：统计每节点车辆数
+        node_counts: dict[str, int] = {}
+        for _vid, v in ctx["vehicles"].items():
+            pos = v.get("position")
+            if not pos:
+                continue
+            node = self.sdk.find_nearest_node(pos[0], pos[1])
+            if node:
+                node_counts[node] = node_counts.get(node, 0) + 1
+        for node, cnt in node_counts.items():
+            if cnt >= 2:
+                penalties[node] = penalties.get(node, 0.0) + 20.0
+
+        # 边占用惩罚：未来路径点
+        for _vid, v in ctx["vehicles"].items():
+            for point in v.get("path_preview", [])[:3]:
+                pnode = self.sdk.find_nearest_node(point[0], point[1])
+                if pnode:
+                    penalties[pnode] = penalties.get(pnode, 0.0) + 20.0
+
+        return penalties
+
+
+# ======================================================================
+# V5：时空联合路径规划
+# ======================================================================
+
+class V5Strategy(V4Strategy):
+    """V5：继承 V4 拥堵路径 + 估算到达时间线，检测时空冲突并分级错峰。"""
 
     def __call__(self, state: dict) -> dict:
         ctx = self._prepare(state)
@@ -356,50 +424,40 @@ class V4Strategy(V3Strategy):
         commands = self._compute_commands(ctx)
         return self._resolve_time_conflicts(commands)
 
-    # ------------------------------------------------------------------
-    # 时空冲突检测
-    # ------------------------------------------------------------------
-
     def _resolve_time_conflicts(self, commands: dict) -> dict:
-        """估算每条路径的到达时间线，检测时间重叠的节点冲突。"""
+        """估算每条路径的时间线，检测时间重叠的节点冲突。"""
         if len(commands) < 2:
             return commands
 
-        # 1. 为每条路径建立时间线 [(node, arrival_time), ...]
         timelines = {}
         for vid, cmd in commands.items():
             tl = self._build_timeline(cmd)
             if tl:
                 timelines[vid] = tl
 
-        # 2. 逐对检测时间冲突
         vids = sorted(timelines.keys(), key=vehicle_sort_key)
         for i in range(len(vids)):
             for j in range(i + 1, len(vids)):
-                a, b = vids[i], vids[j]  # a 优先级更高
+                a, b = vids[i], vids[j]
                 conflict = self._find_time_conflict(timelines[a], timelines[b])
                 if not conflict:
                     continue
-
-                _node, t_a, t_b = conflict
-                gap = abs(t_a - t_b)
+                _node, _t_a, _t_b = conflict
+                gap = abs(_t_a - _t_b)
                 if gap < 1.0:
-                    # 几乎同时到达同一节点/边 → 爬行等待，让对方先过
                     commands[b]["speed"] = 3.0
                 elif gap < 2.0:
                     commands[b]["speed"] = 10.0
                 else:
                     commands[b]["speed"] = 14.0
-
         return commands
 
     def _build_timeline(self, cmd: dict) -> list[tuple[str, float]]:
-        """估算路径上每个节点的到达时间（假设从路径起点匀速）。"""
+        """估算路径上各节点的到达时刻（距离 ÷ 速度）。"""
         pts = cmd.get("path", [])
         speed = cmd.get("speed", 20.0)
         if len(pts) < 2 or speed <= 0:
             return []
-
         timeline = []
         dist = 0.0
         prev = pts[0]
@@ -415,7 +473,7 @@ class V4Strategy(V3Strategy):
     def _find_time_conflict(
             tl_a: list[tuple[str, float]],
             tl_b: list[tuple[str, float]]) -> tuple[str, float, float] | None:
-        """找到第一个时间窗口重叠(3s内)的节点冲突。"""
+        """找第一个 3s 内时间重叠的节点冲突。"""
         nodes_a = {n: t for n, t in tl_a}
         for node, t_b in tl_b:
             if node in nodes_a:
@@ -426,68 +484,26 @@ class V4Strategy(V3Strategy):
 
 
 # ======================================================================
-# V5：局部避碰降速
-# ======================================================================
-
-class V5Strategy(V4Strategy):
-    """V5：极近距离(2m)内减速防撞，安全后恢复。只做最后一道防线。"""
-
-    SLOW_SPEED = 14.0
-    SAFETY_DISTANCE = 2.0
-
-    def __call__(self, state: dict) -> dict:
-        ctx = self._prepare(state)
-        self.memory.prune(ctx["vehicles"], ctx["time"], self.STALE_TASK_SECONDS)
-        commands = self._compute_commands(ctx)
-        return self._apply_safety_speed(commands, ctx)
-
-    def _apply_safety_speed(self, commands: dict, ctx: dict) -> dict:
-        for vid, cmd in commands.items():
-            vehicle = ctx["vehicles"].get(vid)
-            if not vehicle:
-                continue
-            if self._has_close_vehicle(vid, vehicle, ctx["vehicles"]):
-                cmd["speed"] = self.SLOW_SPEED
-                self.memory.low_speed_vehicles.add(vid)
-            elif vid in self.memory.low_speed_vehicles:
-                cmd["speed"] = self.CRUISE_SPEED
-                self.memory.low_speed_vehicles.discard(vid)
-        return commands
-
-    def _has_close_vehicle(self, vid: str, vehicle: dict,
-                           vehicles: dict) -> bool:
-        pos = vehicle.get("position")
-        for oid, o in vehicles.items():
-            if oid == vid:
-                continue
-            if vehicle_sort_key(oid) > vehicle_sort_key(vid):
-                continue
-            if self.sdk.distance(pos, o.get("position")) < self.SAFETY_DISTANCE:
-                return True
-        return False
-
-
-# ======================================================================
-# VN：完整协同 + 动态校验
+# VN：超时任务释放
 # ======================================================================
 
 class VNStrategy(V5Strategy):
-    """VN：超时任务释放——移动中车辆任务过久未完成则强制释放重新调度。"""
+    """VN：超时任务释放——移动中车辆任务过久未完成则清空路径重新调度。"""
 
     def __call__(self, state: dict) -> dict:
         ctx = self._prepare(state)
         self.memory.prune(ctx["vehicles"], ctx["time"], self.STALE_TASK_SECONDS)
         commands = self._compute_commands(ctx)
+        commands = self._resolve_time_conflicts(commands)
 
-        # 检查移动中车辆是否有过期的活动任务，强制释放
+        # 超时任务强制释放
         for vid, active in list(self.memory.active_tasks.items()):
             vehicle = ctx["vehicles"].get(vid, {})
             if vehicle.get("status") != "moving":
                 continue
             if ctx["time"] - active.assigned_at > self.STALE_TASK_SECONDS:
-                # 任务超时：清空路径让车停下来，下个 tick 重新调度
                 if vid not in commands:
                     commands[vid] = {"path": [], "action": None}
                 self.memory.active_tasks.pop(vid, None)
 
-        return self._apply_safety_speed(commands, ctx)
+        return commands

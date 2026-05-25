@@ -1,4 +1,4 @@
-"""V5 策略入口：极近距离防撞减速——最后一道安全防线。"""
+"""V5 策略入口：时空联合路径规划——时间线冲突检测 + 分级错峰。"""
 
 import os
 import sys
@@ -19,6 +19,6 @@ def my_strategy(state):
 
 
 if __name__ == "__main__":
-    print("=== V5 极近距离防撞策略 ===")
+    print("=== V5 时空联合路径规划策略 ===")
     print("连接到:", SERVER_URL)
     sdk.run(my_strategy)
