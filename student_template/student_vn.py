@@ -1,4 +1,4 @@
-"""VN 最终策略入口：完整协同调度 + 动态重规划。"""
+"""VN 最终策略入口：超时任务释放——久未完成的任务强制释放重新调度。"""
 
 import os
 import sys
@@ -19,6 +19,6 @@ def my_strategy(state):
 
 
 if __name__ == "__main__":
-    print("=== VN 最终协同供应链策略占位 ===")
+    print("=== VN 超时任务释放策略 ===")
     print("连接到:", SERVER_URL)
     sdk.run(my_strategy)
