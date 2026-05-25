@@ -277,7 +277,7 @@ final_score = priority - cost
 
 ### 5.4 路径协同模块
 
-基础路径仍使用 SDK 的 Dijkstra，但可以在 `agent_sdk.py` 或 `student.py` 中扩展“带拥堵惩罚”的路径评分：
+基础路径仍使用 SDK 的 Dijkstra。策略侧扩展统一放在 `student_template/strategy/sdk_ext.py`，例如“带拥堵惩罚”的路径评分：
 
 - 统计其他车辆当前所在节点或路径预览附近节点。
 - 对拥堵节点、目标区域入口节点增加临时权重。
@@ -416,32 +416,163 @@ order_priority = value(product) * 1.0
 - 如果投递收益高但订单收益低，说明原料补给过多，成品配送不足。
 - 如果碰撞扣分下降但订单数也下降，说明避碰过于保守，需要提高恢复速度或减少等待。
 
-## 8. 代码实现建议
+## 8. 代码结构与接口规范
 
-主要修改 `student_template/student.py`，必要时再扩展 `sdk/agent_sdk.py`。
+当前项目保留老师模板入口 `student_template/student.py`，同时新增独立版本文件和可复用策略包，便于做 V0-VN 对比实验。
 
-### 8.1 `student.py` 建议结构
+### 8.1 文件结构
 
 ```text
-常量与配方信息
-工具函数：距离、路径长度、订单价值、紧急度
-状态解析：build_world_view(state)
-任务生成：build_tasks(world)
-任务分配：assign_tasks(world, tasks)
-路径与命令：make_command(vehicle, task)
-避碰控制：apply_safety_speed(commands, state)
-主入口：my_strategy(state)
+student_template/
+  student.py                  老师模板入口，保留为默认策略
+  student_v0.py               V0 基准策略：分散式贪心 + target_zone 防误触发
+  student_v1.py               V1 策略入口：V0 + 目标占用表
+  student_v2.py               V2 策略入口占位：收益/距离/紧急度评分
+  student_v3.py               V3 策略入口占位：前馈补料
+  student_v4.py               V4 策略入口占位：路径协同与避碰
+  student_vn.py               VN 最终策略入口占位：完整协同调度
+  strategy/
+    __init__.py               导出可复用策略类
+    models.py                 Task、WorldView、StrategyConfig、StrategyMemory 等数据模型
+    utils.py                  车辆排序、订单字段兼容、紧急度等策略业务工具
+    sdk_ext.py                StrategySDK：继承老师 AgentSDK，补充距离和加权寻路接口
+    registry.py               ClaimRegistry：目标占用与在途任务登记
+    planner.py                V1/V2/V3 任务规划逻辑和核心扩展占位
+    strategy.py               V1/V2/V3/V4/VN 主策略、状态解析、命令构造、避碰和重规划入口
+sdk/
+  agent_sdk.py                老师提供的基础 SDK，负责通信、地图读取和基础寻路
 ```
 
-### 8.2 `agent_sdk.py` 可选扩展
+### 8.2 统一入口规范
 
-可选新增方法：
+所有可运行版本都应保持以下入口，便于服务端直接调用：
 
-- `path_distance(node_ids)`：计算路径总长度。
-- `plan_path_with_penalty(start, end, penalty_nodes)`：对拥堵节点加权后规划路径。
-- `zone_distance(from_position, zone_id)`：估计车辆到目标区域距离。
+```python
+from student_template.strategy import SomeStrategy
+from student_template.strategy.sdk_ext import StrategySDK
 
-如果时间有限，建议只改 `student.py`。因为 SDK 已经提供 `find_nearest_node`、`plan_path`、`nodes_to_points` 和 `navigate_to`，足够支持大部分策略迭代。
+SERVER_URL = "ws://localhost:8765"
+sdk = StrategySDK(SERVER_URL)
+strategy = SomeStrategy(sdk)
+
+
+def my_strategy(state):
+    return strategy(state)
+
+
+if __name__ == "__main__":
+    sdk.run(my_strategy)
+```
+
+不同版本通过运行不同文件切换：
+
+```bash
+python student_template/student_v0.py
+python student_template/student_v1.py
+python student_template/student_v2.py
+python student_template/student_v3.py
+python student_template/student_v4.py
+python student_template/student_vn.py
+```
+
+### 8.3 核心数据模型接口
+
+`Task` 是调度模块之间传递的最小任务单元：
+
+```python
+Task(
+    kind=TaskKind.PICK_RAW | DROP_MATERIAL | PICK_PRODUCT | DROP_PRODUCT,
+    item="A1" or "B1",
+    pick_zone="raw_a1" or "proc_b1",
+    drop_zone="proc_b1" or "cons_c1",
+    order_id="o1",
+    priority=10.0,
+    reason="debug text",
+)
+```
+
+接口约定：
+
+| 字段 | 说明 |
+| --- | --- |
+| `kind` | 任务类型，决定最终 action 是 `pick` 还是 `drop` |
+| `item` | 运输物品，例如 A1 或 B1 |
+| `pick_zone` | 取货任务目标区域 |
+| `drop_zone` | 投递任务目标区域 |
+| `order_id` | 如果任务服务某个订单，则记录订单号 |
+| `priority` | 任务优先级，V2 后用于集中式排序 |
+| `reason` | 调试说明，用于日志和报告分析 |
+
+`WorldView` 是对原始 `state` 的规范化视图：
+
+```python
+world.time
+world.vehicles
+world.zones
+world.orders
+world.raw_items
+world.product_items
+world.raw_zones
+world.processing_zones
+world.consumer_zones
+world.pending_orders()
+```
+
+后续所有策略模块只依赖 `WorldView`，避免在各处重复解析原始状态。
+
+### 8.4 模块接口规范
+
+| 模块 | 类/方法 | 输入 | 输出 | 当前版本职责 | 后续扩展 |
+| --- | --- | --- | --- | --- | --- |
+| 状态解析 | `V1Strategy._build_world(state)` | 原始 state | `WorldView` | 提取车辆、区域、订单、原料和成品集合 | 增加订单统计、加工区产能估计 |
+| 目标占用 | `ClaimRegistry.from_memory(memory, world)` | 记忆、状态 | `ClaimRegistry` | 恢复移动中车辆的目标占用 | 加入路径边占用、目标队列 |
+| 目标占用 | `can_claim(task)` / `claim(task)` | `Task` | bool / None | 防止同 tick 重复抢目标 | 支持多车协同投同一配方但不重复同一原料 |
+| 任务规划 | `V1TaskPlanner.choose_task(vid, vehicle, world, registry)` | 单车状态、全局状态、占用表 | `Task` 或 None | 在 V0 贪心基础上跳过已占用目标 | V2 加收益/距离评分，V3 加前馈补料 |
+| 任务评分 | `V2TaskPlanner._order_priority(world, order)` | 订单 | float | 默认保持 deadline 优先 | 加入订单价值、距离、超时惩罚 |
+| 任务距离 | `V2TaskPlanner._estimate_task_distance(vehicle, task)` | 车辆、任务 | float | 调用 `sdk.zone_distance()` | 为收益/距离综合评分提供成本项 |
+| 前馈补料 | `V3TaskPlanner._choose_forward_fill_task(world, registry)` | 状态、占用表 | `Task` 或 None | V3 预留接口 | 没有紧急任务时主动补齐加工区原料 |
+| 命令构造 | `V1Strategy._build_command(vehicle, task)` | 车辆、任务 | SDK command | 统一生成 path/action/speed，并强制写 `target_zone` | 接入拥堵加权路径和等待点 |
+| 安全控制 | `V4Strategy._apply_safety_speed(commands, world)` | 命令、状态 | commands | V1 默认透传 | V4 开启局部避碰降速和恢复 |
+| 拥堵建模 | `V4Strategy._build_node_penalties(world)` | 状态 | 节点惩罚表 | V4 预留接口 | 结合车辆位置和 path_preview 生成拥堵权重 |
+| 动态重规划 | `VNStrategy._validate_task(task, vehicle, world)` | 任务、车辆、状态 | 修正后的任务 | VN 预留接口 | 处理目标失效、任务释放和改派 |
+| 主策略 | `V1Strategy.__call__(state)` | 原始 state | commands | 串联所有模块 | VN 中增加动态重规划和任务释放 |
+
+### 8.5 V1 实现细节
+
+V1 在 V0 基础上完成三个改进：
+
+1. 所有 `pick/drop` 命令统一写入 `target_zone`，避免车辆经过其他可交互区域时误触发。
+2. 新增 `ClaimRegistry`，在每个 tick 内登记已分配目标，避免多车同时抢同一个原料区、成品区或订单消费区。
+3. 新增 `StrategyMemory.active_tasks`，记录移动中车辆的任务，让下一 tick 的空闲车辆知道哪些目标已有车辆在途。
+
+V1 的车辆决策顺序仍与 V0 保持一致，方便对比：
+
+```text
+携带原料 -> 送往缺该原料且未被占用的加工区
+携带成品 -> 送往对应订单且未被占用的消费区
+空车 -> 优先取紧急订单对应的已完成成品
+空车 -> 若无成品可取，则按紧急订单反推缺料并去原料区取货
+```
+
+### 8.6 策略侧增强 SDK
+
+为避免直接修改老师提供的 `sdk/agent_sdk.py`，本组在 `student_template/strategy/sdk_ext.py` 中新增 `StrategySDK`，继承原 `AgentSDK` 并补充策略需要的辅助方法。V1 到 VN 的入口文件统一使用 `StrategySDK`。
+
+| 方法 | 作用 |
+| --- | --- |
+| `get_zone_node(zone_id)` | 查询区域所在图节点 |
+| `distance(a, b)` | 计算两个坐标点欧氏距离 |
+| `points_distance(points)` | 计算坐标路径总长度 |
+| `path_distance(node_ids)` | 计算节点路径总长度 |
+| `zone_distance(from_position, zone_id)` | 估计当前位置到区域的道路距离 |
+| `plan_path_with_penalty(start_node, end_node, node_penalties)` | 对拥堵节点加临时惩罚后规划路径 |
+
+这些接口主要服务 V2-V4：
+
+- V2 用 `zone_distance` 做收益/距离任务评分。
+- V3 用 `path_distance` 估计补料链路成本。
+- V4 用 `plan_path_with_penalty` 绕开拥堵节点。
+- VN 用 `points_distance` 和 `distance` 做动态重规划和避碰。
 
 ## 9. 三人分工与个人贡献
 
@@ -486,4 +617,3 @@ order_priority = value(product) * 1.0
 | 中 | 实现局部避碰降速与恢复 | 优先降低当前最高的碰撞扣分 |
 | 中 | 增加卡住和目标失效重规划 | 提高最终版本稳定性 |
 | 低 | 扩展 SDK 的拥堵加权 Dijkstra | 如果时间不足，可先用目标选择和速度控制替代 |
-
