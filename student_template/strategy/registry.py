@@ -1,12 +1,12 @@
-"""用于减少重复分配的目标占用登记表。"""
+"""目标占用登记表，防止多车抢同一目标。"""
 
 from __future__ import annotations
 
-from .models import ActiveTask, Task, TaskKind, StrategyMemory, WorldView
+from .models import ActiveTask, Task, TaskKind, StrategyMemory
 
 
 class ClaimRegistry:
-    """记录当前 tick 或移动中车辆已经占用的目标。"""
+    """记录当前 tick 内已分配 + 移动中车辆已占用的目标。"""
 
     def __init__(self) -> None:
         self.raw_pick_zones: set[str] = set()
@@ -15,11 +15,11 @@ class ClaimRegistry:
         self.material_drops: set[tuple[str, str]] = set()
 
     @classmethod
-    def from_memory(cls, memory: StrategyMemory, world: WorldView) -> "ClaimRegistry":
+    def from_memory(cls, memory: StrategyMemory, vehicles: dict) -> "ClaimRegistry":
+        """从记忆恢复移动中车辆占用的目标。"""
         registry = cls()
         for active in memory.active_tasks.values():
-            vehicle = world.vehicles.get(active.vehicle_id, {})
-            if vehicle.get("status") == "moving":
+            if vehicles.get(active.vehicle_id, {}).get("status") == "moving":
                 registry.claim(active.task)
         return registry
 
