@@ -1,4 +1,4 @@
-"""V4 策略入口：拥堵感知路径规划 + 局部避碰降速。"""
+"""V4 策略入口：时空路径协同——预测到达时间，冲突时减速/爬行错峰。"""
 
 import os
 import sys
@@ -19,6 +19,6 @@ def my_strategy(state):
 
 
 if __name__ == "__main__":
-    print("=== V4 协同供应链策略占位 ===")
+    print("=== V4 时空路径协同策略 ===")
     print("连接到:", SERVER_URL)
     sdk.run(my_strategy)
