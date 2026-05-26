@@ -227,8 +227,7 @@ class V1Strategy:
         return sorted(ctx["pending_orders"], key=order_deadline)
 
     def _order_priority(self, ctx: dict, order: dict) -> float:
-        deadline = float(order.get("deadline", float("inf")))
-        return 1000.0 * urgency_score(ctx["time"], deadline)
+        return 0
 
     # ==================================================================
     # 命令构造（V4 重写加入拥堵感知）
