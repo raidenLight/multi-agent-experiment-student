@@ -63,6 +63,8 @@ class StrategyMemory:
 
     active_tasks: dict[str, ActiveTask] = field(default_factory=dict)
     low_speed_vehicles: set[str] = field(default_factory=set)
+    last_nodes: dict[str, str] = field(default_factory=dict)
+    last_replan_time: dict[str, float] = field(default_factory=dict)
 
     def prune(self, vehicles: dict, current_time: float, stale_seconds: float) -> None:
         """清理已完成或过期的活动任务。"""
@@ -76,3 +78,11 @@ class StrategyMemory:
                 self.active_tasks.pop(vid, None)
             elif current_time - active.assigned_at > stale_seconds:
                 self.active_tasks.pop(vid, None)
+
+        for vid in list(self.last_nodes):
+            if vid not in vehicles:
+                self.last_nodes.pop(vid, None)
+
+        for vid in list(self.last_replan_time):
+            if vid not in vehicles:
+                self.last_replan_time.pop(vid, None)

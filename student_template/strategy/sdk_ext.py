@@ -74,6 +74,53 @@ class StrategySDK(AgentSDK):
 
         return []
 
+    def plan_path_with_blocked(
+            self,
+            start_node: str,
+            end_node: str,
+            blocked_nodes: set[str] | None = None,
+            node_penalties: Mapping[str, float] | None = None) -> list[str]:
+        """规划一条避开禁用节点的路径，可叠加节点惩罚。"""
+        if start_node == end_node:
+            return [start_node]
+
+        blocked_nodes = blocked_nodes or set()
+        node_penalties = node_penalties or {}
+        dist = {start_node: 0.0}
+        prev = {start_node: None}
+        heap = [(0.0, start_node)]
+        visited = set()
+
+        import heapq
+
+        while heap:
+            d, u = heapq.heappop(heap)
+            if u in visited:
+                continue
+            visited.add(u)
+
+            if u == end_node:
+                path = []
+                node = end_node
+                while node is not None:
+                    path.append(node)
+                    node = prev[node]
+                return list(reversed(path))
+
+            for neighbor, weight in self._adjacency.get(u, []):
+                if neighbor in visited:
+                    continue
+                if neighbor in blocked_nodes and neighbor != end_node:
+                    continue
+                penalty = float(node_penalties.get(neighbor, 0.0))
+                new_dist = d + weight + penalty
+                if new_dist < dist.get(neighbor, float("inf")):
+                    dist[neighbor] = new_dist
+                    prev[neighbor] = u
+                    heapq.heappush(heap, (new_dist, neighbor))
+
+        return []
+
     def path_distance(self, node_ids: list[str]) -> float:
         """计算一条节点路径的总几何长度。"""
         points = self.nodes_to_points(node_ids)

@@ -5,6 +5,7 @@ V1 → V2 → V3 → V4 → VN
 
 from __future__ import annotations
 
+import random
 from typing import Optional
 
 from .models import ActiveTask, StrategyMemory, Task, TaskKind
@@ -343,71 +344,221 @@ class V3Strategy(V2Strategy):
 
 
 # ======================================================================
-# V4：拥堵感知路径规划（带惩罚的 Dijkstra）
+# V4：碰撞预警 + 低收益车辆重规划
 # ======================================================================
 
 class V4Strategy(V3Strategy):
-    """V4：对车辆聚集的节点/边加惩罚权重，Dijkstra 自动绕开拥堵路段。"""
+    """V4：检测近距离车辆，低收益车避让重规划。"""
 
-    def _build_command(self, vehicle: dict, task: Task,
-                       ctx: dict = None) -> Optional[dict]:
-        if task.kind in (TaskKind.WAIT, TaskKind.ABANDON):
-            return super()._build_command(vehicle, task, ctx)
+    COLLISION_WARN_DISTANCE = 3.5
+    REPLAN_COOLDOWN_SECONDS = 4.0
+    EXPECTED_GAIN_WEIGHT = 0.03
+    RANDOM_REPLAN_PROB = 0.15
+    BLOCK_LOOKAHEAD = 1
+    DEFAULT_RAW_REWARD = 30.0
+    DEFAULT_PRODUCT_REWARD = 100.0
 
+    def __call__(self, state: dict) -> dict:
+        ctx = self._prepare(state)
+        self.memory.prune(ctx["vehicles"], ctx["time"], self.STALE_TASK_SECONDS)
+        commands = self._compute_commands(ctx)
+        commands.update(self._build_replan_overrides(ctx))
+        self._update_last_nodes(ctx)
+        return commands
+
+    def _build_replan_overrides(self, ctx: dict) -> dict:
+        if not self.sdk or len(ctx["vehicles"]) < 2:
+            return {}
+
+        cache = self._collect_vehicle_cache(ctx)
+        if len(cache) < 2:
+            return {}
+
+        expected_gains = {
+            vid: self._expected_gain(vid, ctx, cache)
+            for vid in cache
+        }
+
+        replanned: set[str] = set()
+        overrides: dict[str, dict] = {}
+        vids = sorted(cache.keys(), key=vehicle_sort_key)
+
+        for i in range(len(vids)):
+            for j in range(i + 1, len(vids)):
+                a, b = vids[i], vids[j]
+                if a in replanned or b in replanned:
+                    continue
+                if self._distance(cache[a]["pos"], cache[b]["pos"]) > self.COLLISION_WARN_DISTANCE:
+                    continue
+
+                replanner = self._choose_replanner(a, b, ctx, expected_gains)
+                if not replanner:
+                    continue
+                other = b if replanner == a else a
+
+                cmd = self._replan_vehicle(replanner, other, ctx, cache)
+                if cmd:
+                    overrides[replanner] = cmd
+                    replanned.add(replanner)
+                    self.memory.last_replan_time[replanner] = ctx["time"]
+
+        return overrides
+
+    def _collect_vehicle_cache(self, ctx: dict) -> dict[str, dict]:
+        cache: dict[str, dict] = {}
+        for vid, v in ctx["vehicles"].items():
+            pos = v.get("position")
+            if not pos:
+                continue
+            current_node = self.sdk.find_nearest_node(pos[0], pos[1])
+            next_node = self._preview_next_node(v, current_node)
+            cache[vid] = {
+                "pos": pos,
+                "current_node": current_node,
+                "next_node": next_node,
+            }
+        return cache
+
+    def _preview_next_node(self, vehicle: dict, current_node: Optional[str]) -> Optional[str]:
+        preview = vehicle.get("path_preview", [])
+        if preview:
+            node = self.sdk.find_nearest_node(preview[0][0], preview[0][1])
+            return node or current_node
+        return current_node
+
+    def _expected_gain(self, vid: str, ctx: dict, cache: dict) -> float:
+        active = self.memory.active_tasks.get(vid)
+        if not active:
+            return 0.0
+
+        task = active.task
+        reward = self._task_reward(task)
+        dist = self._estimate_task_distance(cache[vid]["pos"], task)
+        return reward - self.EXPECTED_GAIN_WEIGHT * dist
+
+    def _task_reward(self, task: Task) -> float:
+        if task.kind in {TaskKind.DROP_PRODUCT, TaskKind.PICK_PRODUCT}:
+            return self._product_value(task.item or "")
+        if task.kind in {TaskKind.DROP_MATERIAL, TaskKind.PICK_RAW}:
+            if self.sdk and self.sdk.recipes:
+                return float(self.sdk.recipes.get(task.item, {}).get("value", self.DEFAULT_RAW_REWARD))
+            return self.DEFAULT_RAW_REWARD
+        return 0.0
+
+    def _estimate_task_distance(self, pos: list, task: Task) -> float:
+        if not task.target_zone or not pos:
+            return 0.0
+        return self.sdk.zone_distance(pos, task.target_zone)
+
+    @staticmethod
+    def _distance(a: list, b: list) -> float:
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+    def _choose_replanner(self, a: str, b: str, ctx: dict,
+                          expected_gains: dict[str, float]) -> Optional[str]:
+        now = ctx["time"]
+        a_cd = now - self.memory.last_replan_time.get(a, -1e9) < self.REPLAN_COOLDOWN_SECONDS
+        b_cd = now - self.memory.last_replan_time.get(b, -1e9) < self.REPLAN_COOLDOWN_SECONDS
+        if a_cd and b_cd:
+            return None
+
+        if random.random() < self.RANDOM_REPLAN_PROB:
+            choice = random.choice([a, b])
+        else:
+            if expected_gains[a] == expected_gains[b]:
+                choice = min(a, b)
+            else:
+                choice = a if expected_gains[a] < expected_gains[b] else b
+
+        if choice == a and a_cd:
+            return None if b_cd else b
+        if choice == b and b_cd:
+            return None if a_cd else a
+        return choice
+
+    def _replan_vehicle(self, vid: str, other: str, ctx: dict,
+                        cache: dict[str, dict]) -> Optional[dict]:
+        vehicle = ctx["vehicles"].get(vid, {})
+        if vehicle.get("status") != "moving":
+            return None
+
+        active = self.memory.active_tasks.get(vid)
+        if not active:
+            return None
+
+        task = active.task
         target_zone = task.target_zone
         action_type = task.action_type
         if not target_zone or not action_type:
             return None
 
-        pos = vehicle.get("position")
-        if ctx:
-            penalties = self._build_node_penalties(ctx)
-            start = self.sdk.find_nearest_node(pos[0], pos[1])
-            end = self.sdk.get_zone_node(target_zone)
-            if start and end:
-                # 不对目标节点加惩罚，否则永远到不了
-                penalties.pop(end, None)
-                if penalties:
-                    path = self.sdk.plan_path_with_penalty(start, end, penalties)
-                    if path and len(path) > 1:
-                        return {
-                            "path": self.sdk.nodes_to_points(path),
-                            "action": {"type": action_type, "target_zone": target_zone},
-                            "speed": self.CRUISE_SPEED,
-                        }
+        start = cache[vid]["current_node"]
+        end = self.sdk.get_zone_node(target_zone)
+        if not start or not end:
+            return None
+
+        blocked = self._build_blocked_nodes(vid, other, ctx, cache)
+        blocked.discard(start)
+        blocked.discard(end)
+
+        path = self.sdk.plan_path_with_blocked(start, end, blocked)
+        if path and len(path) > 1:
+            return {
+                "path": self.sdk.nodes_to_points(path),
+                "action": {"type": action_type, "target_zone": target_zone},
+                "speed": self.CRUISE_SPEED,
+            }
 
         return self.sdk.navigate_to(
             target_zone,
             action={"type": action_type, "target_zone": target_zone},
-            from_position=pos,
+            from_position=vehicle.get("position"),
             speed=self.CRUISE_SPEED,
         )
 
-    def _build_node_penalties(self, ctx: dict) -> dict[str, float]:
-        """节点拥堵≥2车 +200；边占用（未来3个路径点）+30。"""
-        penalties: dict[str, float] = {}
+    def _build_blocked_nodes(self, vid: str, other: str, ctx: dict,
+                             cache: dict[str, dict]) -> set[str]:
+        blocked: set[str] = set()
+        direction = self._direction_relation(vid, other, cache)
+        if direction == "oncoming":
+            prev_node = self.memory.last_nodes.get(other)
+            if prev_node:
+                blocked.add(prev_node)
+            return blocked
 
-        # 节点拥堵惩罚：统计每节点车辆数
-        node_counts: dict[str, int] = {}
-        for _vid, v in ctx["vehicles"].items():
+        next_node = cache.get(other, {}).get("next_node")
+        if next_node:
+            blocked.add(next_node)
+
+        preview = ctx["vehicles"].get(other, {}).get("path_preview", [])
+        for point in preview[: self.BLOCK_LOOKAHEAD]:
+            node = self.sdk.find_nearest_node(point[0], point[1])
+            if node:
+                blocked.add(node)
+
+        return blocked
+
+    def _direction_relation(self, a: str, b: str, cache: dict[str, dict]) -> str:
+        last_a = self.memory.last_nodes.get(a)
+        last_b = self.memory.last_nodes.get(b)
+        next_a = cache.get(a, {}).get("next_node")
+        next_b = cache.get(b, {}).get("next_node")
+
+        if last_a and last_b and next_a and next_b:
+            if next_a == last_b and next_b == last_a:
+                return "oncoming"
+            if next_a == next_b and next_a != cache[a].get("current_node"):
+                return "same_direction"
+        return "unknown"
+
+    def _update_last_nodes(self, ctx: dict) -> None:
+        for vid, v in ctx["vehicles"].items():
             pos = v.get("position")
             if not pos:
                 continue
             node = self.sdk.find_nearest_node(pos[0], pos[1])
             if node:
-                node_counts[node] = node_counts.get(node, 0) + 1
-        for node, cnt in node_counts.items():
-            if cnt >= 2:
-                penalties[node] = penalties.get(node, 0.0) + 20.0
-
-        # 边占用惩罚：未来路径点
-        for _vid, v in ctx["vehicles"].items():
-            for point in v.get("path_preview", [])[:3]:
-                pnode = self.sdk.find_nearest_node(point[0], point[1])
-                if pnode:
-                    penalties[pnode] = penalties.get(pnode, 0.0) + 20.0
-
-        return penalties
+                self.memory.last_nodes[vid] = node
 
 
 # ======================================================================
