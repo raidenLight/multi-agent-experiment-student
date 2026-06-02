@@ -190,7 +190,7 @@ async def main():
     p.add_argument("version", nargs="?", default=None, help="版本 e.g. student_v4")
     p.add_argument("seeds", nargs="*", type=int, help="种子列表")
     p.add_argument("--all", action="store_true", help="测试全部 V1-V5+VN")
-    p.add_argument("--runs", type=int, default=3, help="随机种子数量")
+    p.add_argument("--runs", type=int, default=5, help="随机种子数量")
     args = p.parse_args()
 
     if args.all:
@@ -201,7 +201,7 @@ async def main():
         p.print_help()
         return
 
-    seeds = args.seeds if args.seeds else list(range(1, args.runs + 1))
+    seeds = args.seeds if args.seeds else list(range(20, args.runs * 20 + 1, 20))
 
     print(f"Versions: {versions}")
     print(f"Seeds:    {seeds}")
