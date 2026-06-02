@@ -2,5 +2,7 @@ __pycache__/
 .claude/
 docs/
 recordings/
+logs/
+batch_results.json
 CLAUDE.md
 tools/

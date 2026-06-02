@@ -23,7 +23,7 @@ import websockets
 PROJECT_DIR = Path(__file__).resolve().parent
 PORT = 8765
 RECORDING_PORT = 8766
-SPEED = 1000
+SPEED = 100
 TIMEOUT = 300  # 300s仿真 * 1000x ≈ CPU耗时6-9s
 
 
