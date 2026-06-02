@@ -17,9 +17,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sdk.agent_sdk import AgentSDK
+from student_template.strategy.logger import RunLogger
 
 SERVER_URL = "ws://localhost:8765"
 sdk = AgentSDK(SERVER_URL)
+logger = RunLogger("student", sdk)
 
 
 def my_strategy(state):
@@ -170,6 +172,9 @@ def my_strategy(state):
     #     - null                                 不改变当前动作
     #   speed:  可选，设置车辆速度（米/秒）
 
+    logger.log_snapshot(state)
+    for vid, cmd in commands.items():
+        logger.log_command(state, vid, cmd, source="student_greedy")
     return commands
 
 
