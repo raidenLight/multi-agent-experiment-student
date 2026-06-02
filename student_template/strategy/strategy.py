@@ -1,6 +1,6 @@
 """策略实现：单一类继承树，每个版本只重写自己改动的部分。
 
-V1 → V2 → V3 → V4 → VN
+V1 → V2 → V3 → V4 → V5 → VN
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from .utils import (
 
 
 class V1Strategy:
-    """V1：V0 贪心 + target_zone + claimed 目标占用 + 距离排序。"""
+    """V1：V0 贪心 + target_zone + claimed 目标占用。无评分和距离排序。"""
 
     CRUISE_SPEED = 20.0
     STALE_TASK_SECONDS = 45.0
@@ -90,7 +90,6 @@ class V1Strategy:
                 continue
 
             task = self._choose_task(vid, vehicle, ctx, registry)
-            task = self._validate_task(task, vehicle, ctx)
             if not task:
                 continue
 
@@ -121,7 +120,7 @@ class V1Strategy:
         return True
 
     # ==================================================================
-    # 任务选择（V2/V3 重写相关方法）
+    # 任务选择 — V1: V0 决策树 + claim 检查
     # ==================================================================
 
     def _choose_task(self, vehicle_id: str, vehicle: dict,
@@ -132,133 +131,83 @@ class V1Strategy:
         if carrying and carrying in ctx["raw_items"]:
             return self._choose_material_drop(pos, carrying, ctx, registry)
         if carrying:
-            return self._choose_product_drop(carrying, ctx, registry)
+            return self._choose_product_drop(pos, carrying, ctx, registry)
         return self._choose_empty_vehicle_task(pos, ctx, registry)
 
     def _choose_material_drop(self, pos: list, item: str, ctx: dict,
                               registry: ClaimRegistry) -> Optional[Task]:
-        """送原料到最近且缺货的加工区。"""
-        candidates = []
+        """送原料到缺货加工区（首个匹配）。"""
         for zid in ctx["proc_zones"]:
             zone = ctx["zones"][zid]
             if item not in zone.get("inputs", []):
                 continue
-            current = zone.get("items", {}).get(item, 0)
-            in_transit = registry.material_in_transit(zid, item)
-            if current + in_transit >= 1:
+            if zone.get("items", {}).get(item, 0) + registry.material_in_transit(zid, item) >= 1:
                 continue
 
             task = Task(kind=TaskKind.DROP_MATERIAL, item=item, drop_zone=zid,
-                        priority=20.0, reason=f"送 {item} 到 {zid}")
+                        reason=f"送 {item} 到 {zid}")
             if not self._target_zone_available(pos, zid, ctx, task):
                 continue
-            if registry.can_claim(task):
-                candidates.append((self._zone_distance(pos, zid), task))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1]
-        return None
-
-    def _choose_product_drop(self, item: str, ctx: dict,
-                             registry: ClaimRegistry) -> Optional[Task]:
-        """送成品到有对应订单的消费区。"""
-        for order in self._sorted_orders(ctx):
-            if order_product(order) != item:
-                continue
-            consumer = order_consumer(order)
-            if not consumer or not ctx["zones"].get(consumer, {}).get("ready"):
-                continue
-
-            task = Task(kind=TaskKind.DROP_PRODUCT, item=item, drop_zone=consumer,
-                        order_id=order_id(order),
-                        priority=self._order_priority(ctx, order),
-                        reason=f"送 {item} 到订单 {order_id(order)}")
             if registry.can_claim(task):
                 return task
         return None
 
+    def _choose_product_drop(self, pos: list, item: str, ctx: dict,
+                             registry: ClaimRegistry) -> Optional[Task]:
+        """送成品到有对应订单的消费区（首个匹配）。"""
+        orders = sorted(ctx["pending_orders"], key=order_deadline)
+        for order in orders:
+            if order_product(order) != item:
+                continue
+            consumer = order_consumer(order)
+            if consumer and ctx["zones"].get(consumer, {}).get("ready"):
+                task = Task(kind=TaskKind.DROP_PRODUCT, item=item, drop_zone=consumer,
+                            order_id=order_id(order), reason=f"送 {item} 到 {consumer}")
+                if not self._target_zone_available(pos, consumer, ctx, task):
+                    continue
+                if registry.can_claim(task):
+                    return task
+        return None
+
     def _choose_empty_vehicle_task(self, pos: list, ctx: dict,
                                    registry: ClaimRegistry) -> Optional[Task]:
-        """空车：优先取成品 → 反推原料取货。"""
-        return (self._choose_ready_product_pick(pos, ctx, registry)
-                or self._choose_raw_pick_for_orders(pos, ctx, registry))
-
-    def _choose_ready_product_pick(self, pos: list, ctx: dict,
-                                   registry: ClaimRegistry) -> Optional[Task]:
-        """取最近的已完成成品。"""
-        candidates = []
-        for order in self._sorted_orders(ctx):
+        """空车：取成品 → 取原料（首个匹配）。"""
+        orders = sorted(ctx["pending_orders"], key=order_deadline)
+        # 1. 取已完成成品
+        for order in orders:
             product = order_product(order)
             for zid in ctx["proc_zones"]:
                 zone = ctx["zones"][zid]
-                if product not in zone.get("outputs", []) or not zone.get("ready"):
-                    continue
-                task = Task(kind=TaskKind.PICK_PRODUCT, item=product, pick_zone=zid,
-                            order_id=order_id(order),
-                            priority=self._order_priority(ctx, order),
-                            reason=f"取成品 {product}")
-                if not self._target_zone_available(pos, zid, ctx, task):
-                    continue
-                if registry.can_claim(task):
-                    candidates.append((self._zone_distance(pos, zid), task))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1]
-        return None
-
-    def _choose_raw_pick_for_orders(self, pos: list, ctx: dict,
-                                    registry: ClaimRegistry) -> Optional[Task]:
-        """根据订单缺口，反推需要取的原料。"""
-        for order in self._sorted_orders(ctx):
+                if product in zone.get("outputs", []) and zone.get("ready"):
+                    task = Task(kind=TaskKind.PICK_PRODUCT, item=product, pick_zone=zid,
+                                order_id=order_id(order), reason=f"取成品 {product}")
+                    if not self._target_zone_available(pos, zid, ctx, task):
+                        continue
+                    if registry.can_claim(task):
+                        return task
+        # 2. 取订单缺口需要的原料
+        for order in orders:
             product = order_product(order)
             for pzid in ctx["proc_zones"]:
                 pz = ctx["zones"][pzid]
                 if product not in pz.get("outputs", []):
                     continue
                 for needed_item in pz.get("inputs", []):
-                    current = pz.get("items", {}).get(needed_item, 0)
-                    in_transit = registry.material_in_transit(pzid, needed_item)
-                    if current + in_transit >= 1:
+                    if pz.get("items", {}).get(needed_item, 0) + registry.material_in_transit(pzid, needed_item) >= 1:
                         continue
-                    task = self._pick_nearest_raw(pos, needed_item, ctx, registry)
-                    if task:
-                        return task
-        return None
-
-    def _pick_nearest_raw(self, pos: list, item: str, ctx: dict,
-                          registry: ClaimRegistry) -> Optional[Task]:
-        """取最近的可用原料。"""
-        candidates = []
-        for rzid in ctx["raw_zones"]:
-            rz = ctx["zones"][rzid]
-            if item not in rz.get("outputs", []) or not rz.get("ready"):
-                continue
-            task = Task(kind=TaskKind.PICK_RAW, item=item, pick_zone=rzid,
-                        priority=10.0, reason=f"取原料 {item}")
-            if not self._target_zone_available(pos, rzid, ctx, task):
-                continue
-            if registry.can_claim(task):
-                candidates.append((self._zone_distance(pos, rzid), task))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1]
+                    for rzid in ctx["raw_zones"]:
+                        rz = ctx["zones"][rzid]
+                        if needed_item in rz.get("outputs", []) and rz.get("ready"):
+                            task = Task(kind=TaskKind.PICK_RAW, item=needed_item,
+                                        pick_zone=rzid, reason=f"取原料 {needed_item}")
+                            if not self._target_zone_available(pos, rzid, ctx, task):
+                                continue
+                            if registry.can_claim(task):
+                                return task
         return None
 
     # ==================================================================
-    # 订单排序与优先级（V2 重写）
-    # ==================================================================
-
-    def _sorted_orders(self, ctx: dict) -> list[dict]:
-        return sorted(ctx["pending_orders"], key=order_deadline)
-
-    def _order_priority(self, ctx: dict, order: dict) -> float:
-        return 0
-
-    # ==================================================================
-    # 命令构造（V4 重写加入拥堵感知）
+    # 命令构造 / 校验
     # ==================================================================
 
     def _build_command(self, vehicle: dict, task: Task,
@@ -312,29 +261,142 @@ class V1Strategy:
 
 
 # ======================================================================
-# V2：收益 + 紧急度综合排序
+# V2：综合评分 + 距离排序
 # ======================================================================
 
 class V2Strategy(V1Strategy):
-    """订单按 收益×1.0 + 紧急度×80 排序。"""
+    """V2：综合订单收益、紧急度、路径距离、原料紧缺度进行智能调度。"""
 
-    def _sorted_orders(self, ctx: dict) -> list[dict]:
-        return sorted(
-            ctx["pending_orders"],
-            key=lambda o: self._order_priority(ctx, o),
-            reverse=True,
-        )
+    # ==================================================================
+    # 评分组件
+    # ==================================================================
 
     def _order_priority(self, ctx: dict, order: dict) -> float:
+        """订单综合评分 = 收益 + 紧急度。"""
         deadline = float(order.get("deadline", float("inf")))
         urgency = urgency_score(ctx["time"], deadline)
         value = self._product_value(order_product(order))
         return value * 1.0 + urgency * 80.0
 
     def _product_value(self, product: str) -> float:
-        if self.sdk and self.sdk.recipes:
-            return float(self.sdk.recipes.get(product, {}).get("value", 100))
-        return 100.0
+        if not self.sdk or not self.sdk.recipes:
+            return 0.0
+        return float(self.sdk.recipes.get(product, {}).get("value", 0))
+
+    def _material_scarcity(self, item: str, ctx: dict) -> float:
+        """原料紧缺度 = 缺该原料的加工区数 ÷ 可取的原料区数。越高越值得取。"""
+        need = sum(1 for zid in ctx["proc_zones"]
+                   if item in ctx["zones"][zid].get("inputs", [])
+                   and ctx["zones"][zid].get("items", {}).get(item, 0) == 0)
+        have = sum(1 for zid in ctx["raw_zones"]
+                   if item in ctx["zones"][zid].get("outputs", [])
+                   and ctx["zones"][zid].get("ready"))
+        return need / max(have, 1)
+
+    def _sorted_orders(self, ctx: dict) -> list[dict]:
+        return sorted(ctx["pending_orders"],
+                      key=lambda o: self._order_priority(ctx, o), reverse=True)
+
+    # ==================================================================
+    # 重写任务选择 — 全部加入距离排序 + 评分
+    # ==================================================================
+
+    def _choose_material_drop(self, pos: list, item: str, ctx: dict,
+                              registry: ClaimRegistry) -> Optional[Task]:
+        """送原料到最近且缺货的加工区。"""
+        candidates = []
+        for zid in ctx["proc_zones"]:
+            zone = ctx["zones"][zid]
+            if item not in zone.get("inputs", []):
+                continue
+            if zone.get("items", {}).get(item, 0) + registry.material_in_transit(zid, item) >= 1:
+                continue
+            task = Task(kind=TaskKind.DROP_MATERIAL, item=item, drop_zone=zid,
+                        priority=20.0, reason=f"送 {item} 到 {zid}")
+            if not self._target_zone_available(pos, zid, ctx, task):
+                continue
+            if registry.can_claim(task):
+                candidates.append((self._zone_distance(pos, zid), task))
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            return candidates[0][1]
+        return None
+
+    def _choose_product_drop(self, pos: list, item: str, ctx: dict,
+                             registry: ClaimRegistry) -> Optional[Task]:
+        """送成品到综合评分最高的订单消费区。"""
+        for order in self._sorted_orders(ctx):
+            if order_product(order) != item:
+                continue
+            consumer = order_consumer(order)
+            if consumer and ctx["zones"].get(consumer, {}).get("ready"):
+                task = Task(kind=TaskKind.DROP_PRODUCT, item=item, drop_zone=consumer,
+                            order_id=order_id(order),
+                            priority=self._order_priority(ctx, order),
+                            reason=f"送 {item} 到 {consumer}")
+                if not self._target_zone_available(pos, consumer, ctx, task):
+                    continue
+                if registry.can_claim(task):
+                    return task
+        return None
+
+    def _choose_empty_vehicle_task(self, pos: list, ctx: dict,
+                                   registry: ClaimRegistry) -> Optional[Task]:
+        """空车：取成品和取原料候选放入同一池，统一评分选最优。"""
+        candidates = []
+
+        # ---- 候选：取成品 ----
+        for order in self._sorted_orders(ctx):
+            product = order_product(order)
+            order_score = self._order_priority(ctx, order)
+            for zid in ctx["proc_zones"]:
+                zone = ctx["zones"][zid]
+                if product not in zone.get("outputs", []) or not zone.get("ready"):
+                    continue
+                task = Task(kind=TaskKind.PICK_PRODUCT, item=product, pick_zone=zid,
+                            order_id=order_id(order), priority=order_score,
+                            reason=f"取成品 {product}")
+                if not self._target_zone_available(pos, zid, ctx, task):
+                    continue
+                if registry.can_claim(task):
+                    dist = self._zone_distance(pos, zid)
+                    # 取成品直接得分 = 订单价值（直接收益）
+                    score = order_score - dist * 0.1
+                    candidates.append((score, task))
+
+        # ---- 候选：取原料 ----
+        for order in self._sorted_orders(ctx):
+            product = order_product(order)
+            order_score = self._order_priority(ctx, order)
+            for pzid in ctx["proc_zones"]:
+                pz = ctx["zones"][pzid]
+                if product not in pz.get("outputs", []):
+                    continue
+                for needed_item in pz.get("inputs", []):
+                    if pz.get("items", {}).get(needed_item, 0) + registry.material_in_transit(pzid, needed_item) >= 1:
+                        continue
+                    for rzid in ctx["raw_zones"]:
+                        rz = ctx["zones"][rzid]
+                        if needed_item not in rz.get("outputs", []) or not rz.get("ready"):
+                            continue
+                        task = Task(kind=TaskKind.PICK_RAW, item=needed_item,
+                                    pick_zone=rzid, priority=10.0,
+                                    reason=f"取原料 {needed_item}")
+                        if not self._target_zone_available(pos, rzid, ctx, task):
+                            continue
+                        if registry.can_claim(task):
+                            dist = self._zone_distance(pos, rzid)
+                            scarcity = self._material_scarcity(needed_item, ctx)
+                            # 取原料间接得分 = 对订单的贡献 + 紧缺度
+                            score = (order_score * 0.5
+                                     + scarcity * 10.0
+                                     - dist * 0.1)
+                            candidates.append((score, task))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
+        return None
 
 
 # ======================================================================
