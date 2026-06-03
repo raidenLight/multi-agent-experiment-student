@@ -450,7 +450,7 @@ class V3Strategy(V2Strategy):
 # ======================================================================
 
 class V4Strategy(V3Strategy):
-    """V4：检测近距离车辆，低收益车避让重规划。"""
+    """V4：默认保持 V3 吞吐；可选启用合法锚点避让。"""
 
     COLLISION_WARN_DISTANCE = 3.5
     IDLE_CLEAR_DISTANCE = 2.0
@@ -479,6 +479,14 @@ class V4Strategy(V3Strategy):
             os.environ.get("V4_CONGESTION_PATH", "0").lower()
             in {"1", "true", "yes", "on"}
         )
+        self.avoidance_enabled = (
+            os.environ.get("V4_AVOIDANCE", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.moving_replan_enabled = (
+            os.environ.get("V4_MOVING_REPLAN", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.CLEARANCE_SPEED = self._env_float("V4_CLEARANCE_SPEED", self.CLEARANCE_SPEED)
         self.REPLAN_COOLDOWN_SECONDS = self._env_float(
             "V4_REPLAN_COOLDOWN", self.REPLAN_COOLDOWN_SECONDS
@@ -501,7 +509,8 @@ class V4Strategy(V3Strategy):
         self.memory.prune(ctx["vehicles"], ctx["time"], self.STALE_TASK_SECONDS)
         self.memory.reserved_clearance_nodes.clear()
         commands = self._compute_commands(ctx)
-        commands.update(self._build_replan_overrides(ctx, commands))
+        if self.avoidance_enabled:
+            commands.update(self._build_replan_overrides(ctx, commands))
         self._update_last_nodes(ctx)
         self.logger.log_snapshot(state, self.memory)
         return commands
@@ -519,8 +528,7 @@ class V4Strategy(V3Strategy):
         if not target_zone or not action_type or not self.sdk or not ctx:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
 
-        start_pos = vehicle.get("position")
-        start = self._node_from_position(start_pos)
+        start, _prefix = self._legal_anchor(vehicle)
         end = self.sdk.get_zone_node(target_zone)
         if not start or not end:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
@@ -530,11 +538,14 @@ class V4Strategy(V3Strategy):
         if not path:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
 
-        command = {
-            "path": self.sdk.nodes_to_points(path),
-            "action": {"type": action_type, "target_zone": target_zone},
-            "speed": self.CRUISE_SPEED,
-        }
+        command = self._command_from_node_path(
+            vehicle,
+            path,
+            {"type": action_type, "target_zone": target_zone},
+            self.CRUISE_SPEED,
+        )
+        if not command:
+            return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
         self.logger.log_event_throttled(
             "v4_congestion_path",
             key=(vehicle_id, target_zone, tuple(path[:4]), tuple(sorted(penalties.items())[:6])),
@@ -634,6 +645,17 @@ class V4Strategy(V3Strategy):
                             self.memory.last_replan_time[clearance_vid] = ctx["time"]
                             continue
 
+                if not self.moving_replan_enabled:
+                    self._log_replan_skip(
+                        "v4_replan_skip",
+                        ctx,
+                        a=a,
+                        b=b,
+                        reason="moving_replan_disabled",
+                        direction=direction,
+                    )
+                    continue
+
                 if direction == "same_direction":
                     follower = self._choose_replanner(a, b, ctx, expected_gains, cache)
                     if follower and follower not in replanned:
@@ -682,6 +704,8 @@ class V4Strategy(V3Strategy):
             reserved_before = set(reserved)
             for vid in sorted(group, key=vehicle_sort_key):
                 if vid == keeper:
+                    continue
+                if ctx["vehicles"].get(vid, {}).get("status") != "idle":
                     continue
                 target = self._safe_neighbor_node(
                     vid, ctx, cache,
@@ -792,6 +816,95 @@ class V4Strategy(V3Strategy):
         if not pos or not self.sdk:
             return None
         return self.sdk.find_nearest_node(pos[0], pos[1])
+
+    def _legal_anchor(self, vehicle: dict) -> tuple[Optional[str], list[list[float]]]:
+        """Return the graph node where a new route may legally branch.
+
+        If the vehicle is already moving, the only road-safe first segment is
+        continuing to the current path target. Branching from the nearest node
+        can create a visual shortcut across grass because the server moves
+        linearly between command path points.
+        """
+        pos = vehicle.get("position")
+        if not pos:
+            return None, []
+
+        preview = vehicle.get("path_preview") or []
+        if vehicle.get("status") == "moving" and preview:
+            anchor_point = preview[0]
+            anchor_node = self._node_from_position(anchor_point)
+            if not anchor_node:
+                return None, []
+            if self._points_close(pos, anchor_point):
+                return anchor_node, [anchor_point]
+            return anchor_node, [pos, anchor_point]
+
+        anchor_node = self._node_from_position(pos)
+        if not anchor_node:
+            return None, []
+        node_points = self.sdk.nodes_to_points([anchor_node])
+        if node_points and not self._points_close(pos, node_points[0]):
+            return anchor_node, [pos, node_points[0]]
+        return anchor_node, node_points or [pos]
+
+    def _command_from_node_path(
+            self,
+            vehicle: dict,
+            node_path: list[str],
+            action: dict | None,
+            speed: float) -> Optional[dict]:
+        if not node_path or not self._is_legal_node_path(node_path):
+            return None
+
+        anchor_node, prefix = self._legal_anchor(vehicle)
+        if not anchor_node:
+            return None
+
+        if node_path[0] != anchor_node:
+            node_path = [anchor_node] + node_path
+        if not self._is_legal_node_path(node_path):
+            return None
+
+        suffix = self.sdk.nodes_to_points(node_path)
+        points = self._merge_points(prefix, suffix)
+        if len(points) < 2:
+            return None
+        return {"path": points, "action": action, "speed": speed}
+
+    def _anchored_preview_path(self, vehicle: dict) -> list[list[float]]:
+        pos = vehicle.get("position")
+        preview = vehicle.get("path_preview") or []
+        if not pos or not preview:
+            return []
+        return self._merge_points([pos], preview)
+
+    def _is_legal_node_path(self, node_path: list[str]) -> bool:
+        if len(node_path) < 2:
+            return True
+        for left, right in zip(node_path, node_path[1:]):
+            if left == right:
+                continue
+            neighbors = {n for n, _weight in self.sdk._adjacency.get(left, [])}
+            if right not in neighbors:
+                return False
+        return True
+
+    def _merge_points(self, first: list[list[float]],
+                      second: list[list[float]]) -> list[list[float]]:
+        points: list[list[float]] = []
+        for point in (first or []) + (second or []):
+            if not point:
+                continue
+            if points and self._points_close(points[-1], point):
+                continue
+            points.append([float(point[0]), float(point[1])])
+        return points
+
+    @staticmethod
+    def _points_close(a: list, b: list, eps: float = 1e-6) -> bool:
+        if not a or not b:
+            return False
+        return abs(a[0] - b[0]) <= eps and abs(a[1] - b[1]) <= eps
 
     def _congestion_penalties(self, ctx: dict, vehicle_id: str | None,
                               end_node: str | None) -> dict[str, float]:
@@ -961,7 +1074,8 @@ class V4Strategy(V3Strategy):
     def _clearance_vehicle(self, vid: str, other: str, ctx: dict,
                            cache: dict[str, dict],
                            target_node: Optional[str] = None) -> Optional[dict]:
-        start = cache.get(vid, {}).get("current_node")
+        vehicle = ctx["vehicles"].get(vid, {})
+        start, _prefix = self._legal_anchor(vehicle)
         target = target_node or self._safe_neighbor_node(vid, ctx, cache)
         if not start or not target:
             self._log_replan_skip(
@@ -974,11 +1088,19 @@ class V4Strategy(V3Strategy):
             return None
 
         path = [start, target]
-        command = {
-            "path": self.sdk.nodes_to_points(path),
-            "action": None,
-            "speed": self.CLEARANCE_SPEED,
-        }
+        command = self._command_from_node_path(vehicle, path, None, self.CLEARANCE_SPEED)
+        if not command:
+            self._log_replan_skip(
+                "v4_replan_skip",
+                ctx,
+                vehicle_id=vid,
+                other_id=other,
+                reason="illegal_clearance_path",
+                start=start,
+                target=target,
+                path_nodes=path,
+            )
+            return None
         self.logger.log_event_throttled(
             "v4_replan",
             key=("idle_clearance", vid, other, start, target),
@@ -1039,7 +1161,7 @@ class V4Strategy(V3Strategy):
             )
             return None
 
-        start = cache[vid]["current_node"]
+        start, _prefix = self._legal_anchor(vehicle)
         end = self.sdk.get_zone_node(target_zone)
         if not start or not end:
             self._log_replan_skip(
@@ -1084,11 +1206,24 @@ class V4Strategy(V3Strategy):
 
         path = self.sdk.plan_path_with_blocked(start, end, blocked)
         if path and len(path) > 1:
-            command = {
-                "path": self.sdk.nodes_to_points(path),
-                "action": {"type": action_type, "target_zone": target_zone},
-                "speed": self.CRUISE_SPEED,
-            }
+            command = self._command_from_node_path(
+                vehicle,
+                path,
+                {"type": action_type, "target_zone": target_zone},
+                self.CRUISE_SPEED,
+            )
+            if not command:
+                self._log_replan_skip(
+                    "v4_replan_skip",
+                    ctx,
+                    vehicle_id=vid,
+                    other_id=other,
+                    reason="illegal_blocked_replan_path",
+                    start=start,
+                    end=end,
+                    path_nodes=path,
+                )
+                return self._speed_stagger_vehicle(vid, other, ctx, task)
             self.logger.log_event(
                 "v4_replan",
                 ctx,
@@ -1106,12 +1241,13 @@ class V4Strategy(V3Strategy):
             self.logger.log_command(ctx, vid, command, task=task, source="v4_replan")
             return command
 
-        command = self.sdk.navigate_to(
-            target_zone,
-            action={"type": action_type, "target_zone": target_zone},
-            from_position=vehicle.get("position"),
-            speed=self.CRUISE_SPEED,
-        )
+        fallback_path = self.sdk.plan_path(start, end)
+        command = self._command_from_node_path(
+            vehicle,
+            fallback_path,
+            {"type": action_type, "target_zone": target_zone},
+            self.CRUISE_SPEED,
+        ) if fallback_path else None
         self.logger.log_event(
             "v4_replan",
             ctx,
@@ -1163,7 +1299,7 @@ class V4Strategy(V3Strategy):
     def _speed_stagger_vehicle(self, vid: str, other: str, ctx: dict,
                                task: Task) -> Optional[dict]:
         vehicle = ctx["vehicles"].get(vid, {})
-        path = vehicle.get("path_preview", [])
+        path = self._anchored_preview_path(vehicle)
         if not path:
             return None
         command = {
@@ -1191,7 +1327,9 @@ class V4Strategy(V3Strategy):
                             cache: dict[str, dict],
                             reserved_nodes: set[str] | None = None,
                             avoid_nodes: set[str] | None = None) -> Optional[str]:
-        current = cache.get(vid, {}).get("current_node")
+        vehicle = ctx["vehicles"].get(vid, {})
+        current, _prefix = self._legal_anchor(vehicle)
+        current = current or cache.get(vid, {}).get("current_node")
         if not current:
             return None
         reserved_nodes = reserved_nodes or set()
