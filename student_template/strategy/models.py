@@ -67,6 +67,11 @@ class StrategyMemory:
     last_replan_time: dict[str, float] = field(default_factory=dict)
     last_clearance_time: dict[str, float] = field(default_factory=dict)
     reserved_clearance_nodes: set[str] = field(default_factory=set)
+    reserved_staging_nodes: set[str] = field(default_factory=set)
+    close_pair_counts: dict[tuple[str, str], int] = field(default_factory=dict)
+    close_pair_first_seen: dict[tuple[str, str], float] = field(default_factory=dict)
+    close_pair_last_seen: dict[tuple[str, str], float] = field(default_factory=dict)
+    hot_nodes: dict[str, float] = field(default_factory=dict)
     deferred_tasks: dict[str, Task] = field(default_factory=dict)
 
     def prune(self, vehicles: dict, current_time: float, stale_seconds: float) -> None:
@@ -97,3 +102,20 @@ class StrategyMemory:
         for vid in list(self.deferred_tasks):
             if vid not in vehicles:
                 self.deferred_tasks.pop(vid, None)
+
+        active_vehicle_ids = set(vehicles)
+        for pair in list(self.close_pair_counts):
+            if pair[0] not in active_vehicle_ids or pair[1] not in active_vehicle_ids:
+                self.close_pair_counts.pop(pair, None)
+                self.close_pair_first_seen.pop(pair, None)
+                self.close_pair_last_seen.pop(pair, None)
+
+        for pair, seen_at in list(self.close_pair_last_seen.items()):
+            if current_time - seen_at > 5.0:
+                self.close_pair_counts.pop(pair, None)
+                self.close_pair_first_seen.pop(pair, None)
+                self.close_pair_last_seen.pop(pair, None)
+
+        for node, seen_at in list(self.hot_nodes.items()):
+            if current_time - seen_at > 5.0:
+                self.hot_nodes.pop(node, None)

@@ -450,16 +450,21 @@ class V3Strategy(V2Strategy):
 # ======================================================================
 
 class V4Strategy(V3Strategy):
-    """V4：默认保持 V3 吞吐；可选启用合法锚点避让。"""
+    """V4：合法锚点避让 + 低扰动持续冲突处理。"""
 
     COLLISION_WARN_DISTANCE = 3.5
     IDLE_CLEAR_DISTANCE = 2.0
     CLEARANCE_SPEED = 12.0
     REPLAN_COOLDOWN_SECONDS = 1.0
-    CLEARANCE_COOLDOWN_SECONDS = 0.4
+    CLEARANCE_COOLDOWN_SECONDS = 2.5
     EXPECTED_GAIN_WEIGHT = 0.03
     RANDOM_REPLAN_PROB = 0.15
     BLOCK_LOOKAHEAD = 3
+    SUSTAINED_CONFLICT_SECONDS = 1.2
+    SUSTAINED_CONFLICT_TICKS = 2
+    DETOUR_RATIO_LIMIT = 1.25
+    SAME_DIRECTION_SPEED = 8.0
+    TARGET_STAGING_DISTANCE = 2.0
     V4_EVENT_LOG_INTERVAL = 1.0
     DEFAULT_RAW_REWARD = 30.0
     DEFAULT_PRODUCT_REWARD = 100.0
@@ -480,11 +485,15 @@ class V4Strategy(V3Strategy):
             in {"1", "true", "yes", "on"}
         )
         self.avoidance_enabled = (
-            os.environ.get("V4_AVOIDANCE", "0").lower()
+            os.environ.get("V4_AVOIDANCE", "1").lower()
             in {"1", "true", "yes", "on"}
         )
         self.moving_replan_enabled = (
             os.environ.get("V4_MOVING_REPLAN", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.target_staging_enabled = (
+            os.environ.get("V4_TARGET_STAGING", "0").lower()
             in {"1", "true", "yes", "on"}
         )
         self.CLEARANCE_SPEED = self._env_float("V4_CLEARANCE_SPEED", self.CLEARANCE_SPEED)
@@ -493,6 +502,9 @@ class V4Strategy(V3Strategy):
         )
         self.COLLISION_WARN_DISTANCE = self._env_float(
             "V4_WARN_DISTANCE", self.COLLISION_WARN_DISTANCE
+        )
+        self.DETOUR_RATIO_LIMIT = self._env_float(
+            "V4_DETOUR_RATIO", self.DETOUR_RATIO_LIMIT
         )
 
     @staticmethod
@@ -508,6 +520,7 @@ class V4Strategy(V3Strategy):
         ctx = self._prepare(state)
         self.memory.prune(ctx["vehicles"], ctx["time"], self.STALE_TASK_SECONDS)
         self.memory.reserved_clearance_nodes.clear()
+        self.memory.reserved_staging_nodes.clear()
         commands = self._compute_commands(ctx)
         if self.avoidance_enabled:
             commands.update(self._build_replan_overrides(ctx, commands))
@@ -520,12 +533,20 @@ class V4Strategy(V3Strategy):
                        registry: ClaimRegistry = None) -> Optional[dict]:
         if task.kind in {TaskKind.WAIT, TaskKind.ABANDON}:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
-        if not self.congestion_path_enabled:
-            return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
 
         target_zone = task.target_zone
         action_type = task.action_type
-        if not target_zone or not action_type or not self.sdk or not ctx:
+        if not target_zone or not action_type:
+            return None
+        if not self.sdk or not ctx:
+            return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
+
+        if self.avoidance_enabled and self.target_staging_enabled:
+            staging = self._target_staging_command(vehicle, task, ctx, vehicle_id)
+            if staging:
+                return staging
+
+        if not self.congestion_path_enabled:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
 
         start, _prefix = self._legal_anchor(vehicle)
@@ -609,6 +630,8 @@ class V4Strategy(V3Strategy):
                     continue
 
                 direction = self._direction_relation(a, b, cache)
+                pair_memory = self._update_conflict_memory(a, b, ctx, cache)
+                sustained = self._is_sustained_conflict(pair_memory)
                 cooldown_age_a = self._cooldown_age(a, ctx)
                 cooldown_age_b = self._cooldown_age(b, ctx)
                 self.logger.log_event_throttled(
@@ -630,6 +653,9 @@ class V4Strategy(V3Strategy):
                     current_node_b=cache[b]["current_node"],
                     next_node_a=cache[a]["next_node"],
                     next_node_b=cache[b]["next_node"],
+                    conflict_count=pair_memory["count"],
+                    conflict_age=round(pair_memory["age"], 3),
+                    sustained=sustained,
                 )
 
                 if self._distance(cache[a]["pos"], cache[b]["pos"]) <= self.IDLE_CLEAR_DISTANCE:
@@ -643,7 +669,19 @@ class V4Strategy(V3Strategy):
                             overrides[clearance_vid] = cmd
                             replanned.add(clearance_vid)
                             self.memory.last_replan_time[clearance_vid] = ctx["time"]
+                            self.memory.last_clearance_time[clearance_vid] = ctx["time"]
                             continue
+
+                if not sustained:
+                    self._log_replan_skip(
+                        "v4_replan_skip",
+                        ctx,
+                        a=a,
+                        b=b,
+                        reason="not_sustained_conflict",
+                        direction=direction,
+                    )
+                    continue
 
                 if not self.moving_replan_enabled:
                     self._log_replan_skip(
@@ -776,6 +814,34 @@ class V4Strategy(V3Strategy):
     def _is_danger_pair(self, a: str, b: str, cache: dict[str, dict]) -> bool:
         dist = self._distance(cache[a]["pos"], cache[b]["pos"])
         return dist < self.IDLE_CLEAR_DISTANCE
+
+    def _update_conflict_memory(self, a: str, b: str, ctx: dict,
+                                cache: dict[str, dict]) -> dict[str, float | int]:
+        pair = self._pair_key(a, b)
+        now = ctx["time"]
+        last_seen = self.memory.close_pair_last_seen.get(pair, -1e9)
+        if now - last_seen > self.SUSTAINED_CONFLICT_SECONDS:
+            count = 1
+            first_seen = now
+        else:
+            count = self.memory.close_pair_counts.get(pair, 0) + 1
+            first_seen = self.memory.close_pair_first_seen.get(pair, now)
+        self.memory.close_pair_counts[pair] = count
+        self.memory.close_pair_first_seen[pair] = first_seen
+        self.memory.close_pair_last_seen[pair] = now
+
+        for vid in pair:
+            node = cache.get(vid, {}).get("current_node")
+            if node:
+                self.memory.hot_nodes[node] = now
+
+        return {"count": count, "age": now - first_seen}
+
+    def _is_sustained_conflict(self, pair_memory: dict[str, float | int]) -> bool:
+        return (
+            int(pair_memory.get("count", 0)) >= self.SUSTAINED_CONFLICT_TICKS
+            or float(pair_memory.get("age", 0.0)) >= self.SUSTAINED_CONFLICT_SECONDS
+        )
 
     def _choose_emergency_keeper(self, group: set[str], ctx: dict,
                                  expected_gains: dict[str, float]) -> str:
@@ -986,6 +1052,112 @@ class V4Strategy(V3Strategy):
                 return False
         return True
 
+    def _target_staging_command(self, vehicle: dict, task: Task, ctx: dict,
+                                vehicle_id: str | None) -> Optional[dict]:
+        target_zone = task.target_zone
+        if not target_zone or not self.sdk:
+            return None
+
+        zone = ctx.get("zones", {}).get(target_zone, {})
+        if zone.get("type") != "processing":
+            return None
+
+        zone_pos = self.sdk.get_zone_position(target_zone)
+        target_node = self.sdk.get_zone_node(target_zone)
+        pos = vehicle.get("position")
+        if not zone_pos or not target_node or not pos:
+            return None
+
+        # If the vehicle is already close enough, let the normal command carry
+        # the interaction action so pick/drop can complete.
+        if self._distance(pos, zone_pos) <= self.IDLE_CLEAR_DISTANCE:
+            return None
+        if not self._target_physically_busy(target_zone, target_node, ctx, vehicle_id):
+            return None
+
+        start, _prefix = self._legal_anchor(vehicle)
+        staging = self._staging_node_for_target(target_node, ctx, vehicle_id)
+        if not start or not staging:
+            return None
+        if start == staging:
+            return {"path": [], "action": None, "speed": 0.0}
+
+        node_path = self.sdk.plan_path(start, staging)
+        command = self._command_from_node_path(
+            vehicle, node_path, None, self.CRUISE_SPEED
+        ) if node_path else None
+        if not command:
+            return None
+
+        self.memory.reserved_staging_nodes.add(staging)
+        self.logger.log_event_throttled(
+            "v4_target_staging",
+            key=(vehicle_id, target_zone, staging),
+            min_interval=self.V4_EVENT_LOG_INTERVAL,
+            state_or_ctx=ctx,
+            vehicle_id=vehicle_id,
+            target_zone=target_zone,
+            target_node=target_node,
+            staging_node=staging,
+            task_kind=task.kind,
+        )
+        return command
+
+    def _target_physically_busy(self, target_zone: str, target_node: str,
+                                ctx: dict, vehicle_id: str | None) -> bool:
+        zone_pos = self.sdk.get_zone_position(target_zone)
+        if not zone_pos:
+            return False
+        for other, other_vehicle in ctx.get("vehicles", {}).items():
+            if other == vehicle_id:
+                continue
+            if other_vehicle.get("status") != "idle":
+                continue
+            other_pos = other_vehicle.get("position")
+            if not other_pos:
+                continue
+            other_node = self._node_from_position(other_pos)
+            if other_node == target_node and self._distance(other_pos, zone_pos) <= self.TARGET_STAGING_DISTANCE:
+                return True
+            if self._distance(other_pos, zone_pos) <= self.IDLE_CLEAR_DISTANCE:
+                return True
+        return False
+
+    def _staging_node_for_target(self, target_node: str, ctx: dict,
+                                 vehicle_id: str | None) -> Optional[str]:
+        occupied = set(self.memory.reserved_staging_nodes)
+        occupied.update(self.memory.reserved_clearance_nodes)
+        for other, vehicle in ctx.get("vehicles", {}).items():
+            if other == vehicle_id:
+                continue
+            node = self._node_from_position(vehicle.get("position"))
+            if node:
+                occupied.add(node)
+            for point in (vehicle.get("path_preview") or [])[:1]:
+                next_node = self._node_from_position(point)
+                if next_node:
+                    occupied.add(next_node)
+
+        candidates = []
+        for neighbor, _weight in self.sdk._adjacency.get(target_node, []):
+            if neighbor in occupied or neighbor == target_node:
+                continue
+            point = self.sdk.nodes_to_points([neighbor])
+            if not point:
+                continue
+            distances = [
+                self._distance(point[0], v.get("position"))
+                for vid, v in ctx.get("vehicles", {}).items()
+                if vid != vehicle_id and v.get("position")
+            ]
+            min_dist = min(distances) if distances else float("inf")
+            hot_penalty = 5.0 if neighbor in self.memory.hot_nodes else 0.0
+            candidates.append((min_dist - hot_penalty, neighbor))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
     def _preview_next_node(self, vehicle: dict, current_node: Optional[str]) -> Optional[str]:
         preview = vehicle.get("path_preview", [])
         for point in preview:
@@ -1036,6 +1208,8 @@ class V4Strategy(V3Strategy):
                 continue
             if cache.get(vid, {}).get("current_node") == cache.get(vid, {}).get("next_node"):
                 continue
+            if self._is_replan_protected(vid, ctx, cache, expected_gains):
+                continue
             candidates.append(vid)
 
         if not candidates:
@@ -1047,6 +1221,23 @@ class V4Strategy(V3Strategy):
             return random.choice(candidates)
         return min(candidates, key=lambda vid: (expected_gains[vid], vid))
 
+    def _is_replan_protected(self, vid: str, ctx: dict, cache: dict[str, dict],
+                             expected_gains: dict[str, float]) -> bool:
+        vehicle = ctx["vehicles"].get(vid, {})
+        active = self.memory.active_tasks.get(vid)
+        task = active.task if active else None
+        carrying = vehicle.get("carrying")
+        if carrying in ctx.get("prod_items", set()):
+            return True
+        if task and task.kind in {TaskKind.DROP_PRODUCT, TaskKind.PICK_PRODUCT}:
+            return True
+        if task and task.target_zone:
+            zone_pos = self.sdk.get_zone_position(task.target_zone)
+            pos = cache.get(vid, {}).get("pos")
+            if zone_pos and pos and self._distance(pos, zone_pos) <= self.COLLISION_WARN_DISTANCE:
+                return True
+        return expected_gains.get(vid, 0.0) >= self.DEFAULT_PRODUCT_REWARD
+
     def _choose_idle_clearance_vehicle(self, a: str, b: str, ctx: dict,
                                        cache: dict[str, dict],
                                        expected_gains: dict[str, float],
@@ -1057,6 +1248,8 @@ class V4Strategy(V3Strategy):
             if vehicle.get("status") != "idle":
                 continue
             if self._in_cooldown(vid, ctx):
+                continue
+            if ctx["time"] - self.memory.last_clearance_time.get(vid, -1e9) < self.CLEARANCE_COOLDOWN_SECONDS:
                 continue
             if not self._safe_neighbor_node(vid, ctx, cache):
                 continue
@@ -1076,7 +1269,14 @@ class V4Strategy(V3Strategy):
                            target_node: Optional[str] = None) -> Optional[dict]:
         vehicle = ctx["vehicles"].get(vid, {})
         start, _prefix = self._legal_anchor(vehicle)
-        target = target_node or self._safe_neighbor_node(vid, ctx, cache)
+        avoid_nodes = self._occupied_target_nodes(ctx)
+        target = target_node or self._safe_neighbor_node(
+            vid,
+            ctx,
+            cache,
+            reserved_nodes=self.memory.reserved_clearance_nodes,
+            avoid_nodes=avoid_nodes,
+        )
         if not start or not target:
             self._log_replan_skip(
                 "v4_replan_skip",
@@ -1119,6 +1319,7 @@ class V4Strategy(V3Strategy):
             path_distance=round(self.sdk.path_distance(path), 3),
         )
         self.logger.log_command(ctx, vid, command, source="v4_idle_clearance")
+        self.memory.reserved_clearance_nodes.add(target)
         self.memory.active_tasks.pop(vid, None)
         return command
 
@@ -1206,6 +1407,24 @@ class V4Strategy(V3Strategy):
 
         path = self.sdk.plan_path_with_blocked(start, end, blocked)
         if path and len(path) > 1:
+            baseline = self.sdk.plan_path(start, end)
+            baseline_distance = self.sdk.path_distance(baseline) if baseline else float("inf")
+            path_distance = self.sdk.path_distance(path)
+            if baseline_distance > 0 and path_distance > baseline_distance * self.DETOUR_RATIO_LIMIT:
+                self._log_replan_skip(
+                    "v4_replan_skip",
+                    ctx,
+                    vehicle_id=vid,
+                    other_id=other,
+                    reason="detour_too_long",
+                    start=start,
+                    end=end,
+                    blocked_nodes=sorted(blocked),
+                    path_distance=round(path_distance, 3),
+                    baseline_distance=round(baseline_distance, 3),
+                    detour_ratio=round(path_distance / baseline_distance, 3),
+                )
+                return self._speed_stagger_vehicle(vid, other, ctx, task)
             command = self._command_from_node_path(
                 vehicle,
                 path,
@@ -1236,18 +1455,11 @@ class V4Strategy(V3Strategy):
                 start=start,
                 end=end,
                 path_nodes=path,
-                path_distance=round(self.sdk.path_distance(path), 3),
+                path_distance=round(path_distance, 3),
             )
             self.logger.log_command(ctx, vid, command, task=task, source="v4_replan")
             return command
 
-        fallback_path = self.sdk.plan_path(start, end)
-        command = self._command_from_node_path(
-            vehicle,
-            fallback_path,
-            {"type": action_type, "target_zone": target_zone},
-            self.CRUISE_SPEED,
-        ) if fallback_path else None
         self.logger.log_event(
             "v4_replan",
             ctx,
@@ -1260,11 +1472,9 @@ class V4Strategy(V3Strategy):
             start=start,
             end=end,
             reason="blocked_path_unavailable",
-            path_distance=round(self.sdk.points_distance(command.get("path", [])), 3) if command else None,
+            path_distance=None,
         )
-        if command:
-            self.logger.log_command(ctx, vid, command, task=task, source="v4_replan_fallback")
-        return command
+        return self._speed_stagger_vehicle(vid, other, ctx, task)
 
     def _build_blocked_nodes(self, vid: str, other: str, ctx: dict,
                              cache: dict[str, dict]) -> set[str]:
@@ -1305,7 +1515,7 @@ class V4Strategy(V3Strategy):
         command = {
             "path": path,
             "action": {"type": task.action_type, "target_zone": task.target_zone},
-            "speed": self.CLEARANCE_SPEED,
+            "speed": self.SAME_DIRECTION_SPEED,
         }
         self.logger.log_event(
             "v4_replan",
@@ -1351,7 +1561,8 @@ class V4Strategy(V3Strategy):
                 for other in cache
                 if other != vid
             )
-            candidates.append((min_dist, neighbor))
+            hot_penalty = 5.0 if neighbor in self.memory.hot_nodes else 0.0
+            candidates.append((min_dist - hot_penalty, neighbor))
         if not candidates:
             return None
         candidates.sort(reverse=True)
