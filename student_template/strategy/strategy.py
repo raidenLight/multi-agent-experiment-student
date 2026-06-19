@@ -1,6 +1,7 @@
 """策略实现：单一类继承树，每个版本只重写自己改动的部分。
 
-V1 → V2 → V3 → V4 → V5 → VN
+任务分配线：V1 → V2 → V3 → V3_1
+路径协同线：V2 → V4 → V5 → VN
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from .logger import RunLogger
 from .models import ActiveTask, StrategyMemory, Task, TaskKind
 from .registry import ClaimRegistry
 from .utils import (
+    hungarian_assign,
     order_consumer,
     order_deadline,
     order_id,
@@ -40,6 +42,7 @@ class V1Strategy:
     def __call__(self, state: dict) -> dict:
         if self._handle_terminal_state(state):
             return {}
+        self._dist_cache.clear()
         ctx = self._prepare(state)
         self.memory.prune(ctx["vehicles"], ctx["time"], self.STALE_TASK_SECONDS)
         commands = self._compute_commands(ctx)
@@ -242,10 +245,19 @@ class V1Strategy:
     # 辅助
     # ==================================================================
 
+    # 距离缓存：每个 tick 内复用 Dijkstra 结果，减少重复寻路
+    _dist_cache: dict = {}
+
     def _zone_distance(self, pos, zone_id: str) -> float:
-        if not self.sdk or not pos:
+        """缓存的 zone 距离（per-tick, 基于最近节点 key）。"""
+        if not self.sdk or not pos or not zone_id:
             return float("inf")
-        return self.sdk.zone_distance(pos, zone_id)
+        # 用最近节点作为 cache key（同一节点出发到同一 zone 距离相同）
+        node = self.sdk.find_nearest_node(pos[0], pos[1])
+        key = (node, zone_id)
+        if key not in self._dist_cache:
+            self._dist_cache[key] = self.sdk.zone_distance(pos, zone_id)
+        return self._dist_cache[key]
 
     def _handle_terminal_state(self, state: dict) -> bool:
         if isinstance(state, dict) and state.get("type") == "game_over":
@@ -265,7 +277,21 @@ class V1Strategy:
 # ======================================================================
 
 class V2Strategy(V1Strategy):
-    """V2：综合订单收益、紧急度、路径距离、原料紧缺度进行智能调度。"""
+    """V2：订单价值驱动的综合评分调度。
+
+    核心改进（相对V1）：
+    1. 所有候选统一打分，按 综合评分 = 订单贡献 - 距离折扣 选最优
+    2. 取原料任务的评分链接到下游订单价值（order_score * 0.5），而非固定值
+    3. 取成品任务考虑后续 delivery 距离（前瞻），避免只选近的pick点忽视远的delivery
+    4. 送原料选最近缺货加工区（纯距离排序，避免无意义长距离运送）
+    """
+
+    # ==================================================================
+    # 评分常量（可通过环境变量微调）
+    # ==================================================================
+    PICK_DISTANCE_WEIGHT = float(os.environ.get("V2_PICK_DIST_WEIGHT", "4.0"))
+    DELIVERY_LOOKAHEAD_WEIGHT = float(os.environ.get("V2_DELIV_LOOKAHEAD", "1.2"))
+    DROP_DISTANCE_WEIGHT = float(os.environ.get("V2_DROP_DIST_WEIGHT", "4.0"))
 
     # ==================================================================
     # 评分组件
@@ -276,7 +302,7 @@ class V2Strategy(V1Strategy):
         deadline = float(order.get("deadline", float("inf")))
         urgency = urgency_score(ctx["time"], deadline)
         value = self._product_value(order_product(order))
-        return value * 1.0 + urgency * 80.0
+        return value * 100.0 + urgency * 100.0
 
     def _product_value(self, product: str) -> float:
         if not self.sdk or not self.sdk.recipes:
@@ -284,7 +310,7 @@ class V2Strategy(V1Strategy):
         return float(self.sdk.recipes.get(product, {}).get("value", 0))
 
     def _material_scarcity(self, item: str, ctx: dict) -> float:
-        """原料紧缺度 = 缺该原料的加工区数 ÷ 可取的原料区数。越高越值得取。"""
+        """原料紧缺度 = 缺该原料的加工区数 ÷ 可取的原料区数。"""
         need = sum(1 for zid in ctx["proc_zones"]
                    if item in ctx["zones"][zid].get("inputs", [])
                    and ctx["zones"][zid].get("items", {}).get(item, 0) == 0)
@@ -293,17 +319,34 @@ class V2Strategy(V1Strategy):
                    and ctx["zones"][zid].get("ready"))
         return need / max(have, 1)
 
+    def _lookahead_distance(self, from_zone_id: str, to_zone_id: str) -> float:
+        """缓存的 zone→zone delivery 距离。"""
+        if not self.sdk or not to_zone_id:
+            return 0.0
+        if not hasattr(self, '_lookahead_cache'):
+            self._lookahead_cache: dict[tuple[str, str], float] = {}
+        key = (from_zone_id, to_zone_id)
+        if key in self._lookahead_cache:
+            return self._lookahead_cache[key]
+        zone_pos = self.sdk.get_zone_position(from_zone_id)
+        if not zone_pos:
+            return 0.0
+        dist = self._zone_distance(zone_pos, to_zone_id)
+        if len(self._lookahead_cache) < 200:
+            self._lookahead_cache[key] = dist
+        return dist
+
     def _sorted_orders(self, ctx: dict) -> list[dict]:
         return sorted(ctx["pending_orders"],
                       key=lambda o: self._order_priority(ctx, o), reverse=True)
 
     # ==================================================================
-    # 重写任务选择 — 全部加入距离排序 + 评分
+    # 任务选择 — 统一打分，选最优
     # ==================================================================
 
     def _choose_material_drop(self, pos: list, item: str, ctx: dict,
                               registry: ClaimRegistry) -> Optional[Task]:
-        """送原料到最近且缺货的加工区。"""
+        """送原料到最近且缺货的加工区（纯距离排序）。"""
         candidates = []
         for zid in ctx["proc_zones"]:
             zone = ctx["zones"][zid]
@@ -316,15 +359,17 @@ class V2Strategy(V1Strategy):
             if not self._target_zone_available(pos, zid, ctx, task):
                 continue
             if registry.can_claim(task):
-                candidates.append((self._zone_distance(pos, zid), task))
+                dist = self._zone_distance(pos, zid)
+                score = 20.0 - dist * self.DROP_DISTANCE_WEIGHT
+                candidates.append((score, task))
         if candidates:
-            candidates.sort(key=lambda x: x[0])
+            candidates.sort(key=lambda x: x[0], reverse=True)
             return candidates[0][1]
         return None
 
     def _choose_product_drop(self, pos: list, item: str, ctx: dict,
                              registry: ClaimRegistry) -> Optional[Task]:
-        """送成品到综合评分最高的订单消费区。"""
+        """送成品到评分最高的订单消费区（首个匹配）。"""
         for order in self._sorted_orders(ctx):
             if order_product(order) != item:
                 continue
@@ -342,13 +387,14 @@ class V2Strategy(V1Strategy):
 
     def _choose_empty_vehicle_task(self, pos: list, ctx: dict,
                                    registry: ClaimRegistry) -> Optional[Task]:
-        """空车：取成品和取原料候选放入同一池，统一评分选最优。"""
+        """空车：取成品/取原料 统一候选池，按订单贡献+距离折扣排序。"""
         candidates = []
 
-        # ---- 候选：取成品 ----
+        # ---- 候选：取成品（含delivery前瞻距离） ----
         for order in self._sorted_orders(ctx):
             product = order_product(order)
             order_score = self._order_priority(ctx, order)
+            consumer = order_consumer(order)
             for zid in ctx["proc_zones"]:
                 zone = ctx["zones"][zid]
                 if product not in zone.get("outputs", []) or not zone.get("ready"):
@@ -359,12 +405,14 @@ class V2Strategy(V1Strategy):
                 if not self._target_zone_available(pos, zid, ctx, task):
                     continue
                 if registry.can_claim(task):
-                    dist = self._zone_distance(pos, zid)
-                    # 取成品直接得分 = 订单价值（直接收益）
-                    score = order_score - dist * 0.1
+                    pick_dist = self._zone_distance(pos, zid)
+                    delivery_dist = self._lookahead_distance(zid, consumer)
+                    score = (order_score
+                             - pick_dist * self.PICK_DISTANCE_WEIGHT
+                             - delivery_dist * self.DELIVERY_LOOKAHEAD_WEIGHT)
                     candidates.append((score, task))
 
-        # ---- 候选：取原料 ----
+        # ---- 候选：取原料（链接到订单价值 + 紧缺度） ----
         for order in self._sorted_orders(ctx):
             product = order_product(order)
             order_score = self._order_priority(ctx, order)
@@ -387,10 +435,9 @@ class V2Strategy(V1Strategy):
                         if registry.can_claim(task):
                             dist = self._zone_distance(pos, rzid)
                             scarcity = self._material_scarcity(needed_item, ctx)
-                            # 取原料间接得分 = 对订单的贡献 + 紧缺度
-                            score = (order_score * 0.5
-                                     + scarcity * 10.0
-                                     - dist * 0.1)
+                            score = (order_score * 0.3
+                                     + scarcity * 30.0
+                                     - dist * self.PICK_DISTANCE_WEIGHT)
                             candidates.append((score, task))
 
         if candidates:
@@ -400,56 +447,597 @@ class V2Strategy(V1Strategy):
 
 
 # ======================================================================
-# V3：前馈补料
+# V3：前馈补料 + 需求中断
 # ======================================================================
 
 class V3Strategy(V2Strategy):
-    """空闲时预存加工区原料，减少成品等待。"""
+    """V3: 全局贪心分配 + 前馈补料 + 任务中断。
 
-    def _choose_empty_vehicle_task(self, pos: list, ctx: dict,
-                                   registry: ClaimRegistry) -> Optional[Task]:
-        task = super()._choose_empty_vehicle_task(pos, ctx, registry)
-        return task or self._choose_forward_fill_task(pos, ctx, registry)
+    相对 V2 的改进：
+    1. 全局贪心：所有空闲车辆候选统一打分、全局排序、贪心分配
+       （V2 逐车贪心：v1 可能抢走 v2 更合适的任务）
+    2. 前馈补料：分配后仍空闲的车辆，预取订单所需原料
+    3. 任务中断：有订单需求时，中断低优先级前馈补料车辆
+    """
 
-    def _choose_forward_fill_task(self, pos: list, ctx: dict,
-                                  registry: ClaimRegistry) -> Optional[Task]:
-        """只在有订单需求时才预补料，避免无需求时车辆空跑。"""
-        # 统计当前订单需要哪些产品
-        ordered_products = {order_product(o) for o in ctx["pending_orders"]}
-        if not ordered_products:
-            return None  # 没订单时不补料
+    FORWARD_FILL_MAX_DISTANCE = 60.0
+    FF_PICK_DISTANCE_WEIGHT = 0.5
+    FORWARD_FILL_PRIORITY = 5.0
 
-        candidates = []
+    # ================================================================
+    # 全局贪心分配 + 中断
+    # ================================================================
+
+    def _compute_commands(self, ctx: dict) -> dict:
+        registry = ClaimRegistry.from_memory(self.memory, ctx["vehicles"])
+        self._augment_registry(registry, ctx)
+        commands: dict = {}
+
+        # Step 0: 有订单需求时中断前馈补料车辆
+        if ctx["pending_orders"]:
+            self._abandon_low_priority_tasks(ctx, commands)
+
+        # Step 1: 收集所有空闲车辆及其候选
+        idle_vehicles = []
+        for vid in sorted(ctx["vehicles"], key=vehicle_sort_key):
+            vehicle = ctx["vehicles"][vid]
+            if vehicle.get("status") != "idle":
+                continue
+            candidates = self._gen_candidates(vehicle, ctx, registry)
+            if candidates:
+                idle_vehicles.append((vid, vehicle, candidates))
+
+        if idle_vehicles:
+            # Step 2: 构建全局打分对 (score, vehicle_index, task_key)
+            scored_pairs = []
+            task_pool: dict[tuple, Task] = {}
+            for vi, (vid, vehicle, candidates) in enumerate(idle_vehicles):
+                pos = vehicle.get("position")
+                for task in candidates:
+                    key = self._task_key(task)
+                    if key not in task_pool:
+                        task_pool[key] = task
+                    dist = self._zone_distance(pos, task.target_zone or "")
+                    # 沿用 V2 的距离折扣：score = task.priority - distance * weight
+                    score = task.priority - dist * V2Strategy.PICK_DISTANCE_WEIGHT
+                    scored_pairs.append((score, vi, key))
+
+            # Step 3: 全局按得分降序排列
+            scored_pairs.sort(key=lambda x: x[0], reverse=True)
+
+            # Step 4: 贪心分配（已分配的车/已领取的任务跳过）
+            assigned: set[int] = set()
+            claimed: set[tuple] = set()
+            for score, vi, key in scored_pairs:
+                if vi in assigned or key in claimed:
+                    continue
+                task = task_pool[key]
+                if not registry.can_claim(task):
+                    continue
+                vid, vehicle, _ = idle_vehicles[vi]
+                if not self._target_zone_available(
+                    vehicle.get("position"), task.target_zone or "", ctx, task
+                ):
+                    continue
+                cmd = self._build_command(
+                    vehicle, task, ctx, vehicle_id=vid, registry=registry
+                )
+                if not cmd:
+                    continue
+                registry.claim(task)
+                self.memory.active_tasks[vid] = ActiveTask(
+                    vehicle_id=vid, task=task, assigned_at=ctx["time"],
+                    start_carrying=vehicle.get("carrying"),
+                )
+                commands[vid] = cmd
+                assigned.add(vi)
+                claimed.add(key)
+                self.logger.log_command(ctx, vid, cmd, task=task, source="v3_greedy")
+
+            # Step 5: 未分配车辆尝试前馈补料
+            for vi, (vid, vehicle, _) in enumerate(idle_vehicles):
+                if vi in assigned:
+                    continue
+                pos = vehicle.get("position")
+                task = self._choose_forward_fill_task(pos, ctx, registry)
+                if task and registry.can_claim(task):
+                    cmd = self._build_command(vehicle, task, ctx,
+                                              vehicle_id=vid, registry=registry)
+                    if cmd:
+                        registry.claim(task)
+                        self.memory.active_tasks[vid] = ActiveTask(
+                            vehicle_id=vid, task=task, assigned_at=ctx["time"],
+                            start_carrying=vehicle.get("carrying"),
+                        )
+                        commands[vid] = cmd
+                        self.logger.log_command(ctx, vid, cmd, task=task, source="v3_ff")
+
+        return commands
+
+    # ================================================================
+    # 中断机制
+    # ================================================================
+
+    def _abandon_low_priority_tasks(self, ctx: dict, commands: dict) -> None:
+        """中断未载货的前馈补料车辆，释放运力给需求任务。"""
+        for vid, active in list(self.memory.active_tasks.items()):
+            if not self._is_forward_fill(active.task):
+                continue
+            vehicle = ctx["vehicles"].get(vid)
+            if not vehicle or vehicle.get("status") != "moving":
+                continue
+            if vehicle.get("carrying") is not None:
+                continue  # 已载货不中断，避免浪费
+            commands[vid] = {"path": [], "action": {"type": "abandon"}}
+            self.memory.active_tasks.pop(vid, None)
+            self.logger.log_command(ctx, vid, commands[vid],
+                                   task=active.task, source="v3_interrupt")
+
+    @staticmethod
+    def _is_forward_fill(task: Task) -> bool:
+        """低优先级（<15）或标记为前馈补料的任务可被中断。"""
+        if task.priority < 15:
+            return True
+        return task.reason.startswith("FF:")
+
+    # ================================================================
+    # 候选生成（为每辆车生成所有可能的任务，不做 claim 检查）
+    # ================================================================
+
+    def _gen_candidates(self, vehicle: dict, ctx: dict,
+                         registry: ClaimRegistry) -> list:
+        """生成该车所有候选任务，存入 task.priority 作为基础优先级。"""
+        carrying = vehicle.get("carrying")
+        tasks = []
+
+        if carrying and carrying in ctx["raw_items"]:
+            # 持原料 → 送加工区（纯距离最优）
+            for zid in ctx["proc_zones"]:
+                z = ctx["zones"][zid]
+                if carrying not in z.get("inputs", []):
+                    continue
+                if z.get("items", {}).get(carrying, 0) + registry.material_in_transit(zid, carrying) >= 1:
+                    continue
+                tasks.append(Task(kind=TaskKind.DROP_MATERIAL, item=carrying,
+                                  drop_zone=zid, priority=20.0,
+                                  reason=f"送 {carrying} 到 {zid}"))
+
+        elif carrying:
+            # 持成品 → 送消费区
+            for o in ctx["pending_orders"]:
+                if order_product(o) != carrying:
+                    continue
+                c = order_consumer(o)
+                if not c or not ctx["zones"].get(c, {}).get("ready"):
+                    continue
+                base = self._order_priority(ctx, o)
+                tasks.append(Task(kind=TaskKind.DROP_PRODUCT, item=carrying,
+                                  drop_zone=c, order_id=order_id(o),
+                                  priority=base, reason=f"送 {carrying} 到 {c}"))
+
+        else:
+            # 空车 → 取成品 + 取原料
+            # 取成品（优先级含 delivery 前瞻距离）
+            for o in ctx["pending_orders"]:
+                p = order_product(o)
+                order_score = self._order_priority(ctx, o)
+                consumer = order_consumer(o)
+                for zid in ctx["proc_zones"]:
+                    z = ctx["zones"][zid]
+                    if p not in z.get("outputs", []) or not z.get("ready"):
+                        continue
+                    delivery_dist = self._lookahead_distance(zid, consumer)
+                    # 优先级预扣 delivery 距离（与车辆位置无关）
+                    pri = order_score - delivery_dist * V2Strategy.DELIVERY_LOOKAHEAD_WEIGHT
+                    tasks.append(Task(kind=TaskKind.PICK_PRODUCT, item=p,
+                                      pick_zone=zid, order_id=order_id(o),
+                                      priority=pri, reason=f"取成品 {p}"))
+            # 取原料（链接到订单价值）
+            for o in ctx["pending_orders"]:
+                p = order_product(o)
+                order_score = self._order_priority(ctx, o)
+                for pzid in ctx["proc_zones"]:
+                    pz = ctx["zones"][pzid]
+                    if p not in pz.get("outputs", []):
+                        continue
+                    for item in pz.get("inputs", []):
+                        if pz.get("items", {}).get(item, 0) + registry.material_in_transit(pzid, item) >= 1:
+                            continue
+                        for rzid in ctx["raw_zones"]:
+                            rz = ctx["zones"][rzid]
+                            if item not in rz.get("outputs", []) or not rz.get("ready"):
+                                continue
+                            scarcity = self._material_scarcity(item, ctx)
+                            base = order_score * 0.5 + scarcity * 10.0
+                            tasks.append(Task(kind=TaskKind.PICK_RAW, item=item,
+                                              pick_zone=rzid, priority=base,
+                                              reason=f"取原料 {item}"))
+        return tasks
+
+    @staticmethod
+    def _task_key(task: Task) -> tuple:
+        return (task.kind.value, task.item, task.pick_zone, task.drop_zone, task.order_id)
+
+    # ================================================================
+    # 前馈补料（低优先级，可中断）
+    # ================================================================
+
+    def _choose_forward_fill_task(self, pos, ctx, registry):
+        """空闲车辆预取订单所需原料，帮助加工区备料。"""
+        ordered = {order_product(o) for o in ctx["pending_orders"]}
+        if not ordered:
+            return None
+        cand = []
         for pzid in ctx["proc_zones"]:
             pz = ctx["zones"][pzid]
-            # 只有产出品有订单需求的加工区才补料
-            if not (set(pz.get("outputs", [])) & ordered_products):
+            if not (set(pz.get("outputs", [])) & ordered):
                 continue
             for item in pz.get("inputs", []):
-                current = pz.get("items", {}).get(item, 0)
-                in_transit = registry.material_in_transit(pzid, item)
-                if current + in_transit >= 1:  # 每种原料只补 1 个
+                if pz.get("items", {}).get(item, 0) + registry.material_in_transit(pzid, item) >= 1:
                     continue
                 for rzid in ctx["raw_zones"]:
                     rz = ctx["zones"][rzid]
                     if item not in rz.get("outputs", []) or not rz.get("ready"):
                         continue
+                    pri = self.FORWARD_FILL_PRIORITY + self._material_scarcity(item, ctx)
                     task = Task(kind=TaskKind.PICK_RAW, item=item, pick_zone=rzid,
-                                priority=5.0, reason=f"前馈补料: 取 {item}")
+                                priority=pri, reason=f"FF:取 {item}")
                     if registry.can_claim(task):
-                        candidates.append((self._zone_distance(pos, rzid), task))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1]
+                        dist = self._zone_distance(pos, rzid)
+                        if dist > self.FORWARD_FILL_MAX_DISTANCE:
+                            continue
+                        cand.append((pri - dist * self.FF_PICK_DISTANCE_WEIGHT, task))
+        if cand:
+            cand.sort(key=lambda x: x[0], reverse=True)
+            return cand[0][1]
         return None
 
 
-# ======================================================================
-# V4：碰撞预警 + 低收益车辆重规划
-# ======================================================================
+class V3_1Strategy(V3Strategy):
+    """V3_1: V3 + 链完成增强 + 拥堵感知分配。
 
-class V4Strategy(V3Strategy):
+    相对 V3 的改进：
+    1. 链完成倍率：原料优先级 × 链完成度倍率（完成度越高越优先）
+    2. 拥堵感知：车辆评分时轻微惩罚同一目标区的已有任务
+       （-10pts/每车已前往该区），仅用于平局决胜
+    3. 最后一块奖励：当原料是加工链的最后一个缺口时，额外 +50% 基础分
+    """
+
+    CHAIN_LAST_PIECE_BONUS = 1.5
+    CONGESTION_PENALTY = 10.0
+    FORWARD_FILL_PRIORITY = 5.0
+
+    # ================================================================
+    # 链完成倍率覆写
+    # ================================================================
+
+    def _gen_candidates(self, vehicle: dict, ctx: dict,
+                         registry: ClaimRegistry) -> list:
+        """生成候选 + 链完成倍率调整优先级。"""
+        tasks = super()._gen_candidates(vehicle, ctx, registry)
+        for task in tasks:
+            if task.kind in (TaskKind.DROP_MATERIAL, TaskKind.PICK_RAW):
+                multiplier = self._chain_completion_multiplier(task.item, ctx, registry)
+                task.priority *= multiplier
+        return tasks
+
+    def _chain_completion_multiplier(self, item: str, ctx: dict,
+                                      registry: ClaimRegistry = None) -> float:
+        """链完成度越高倍率越大，最后一块有额外奖励。
+
+        例：4 种原料已完成 3 种 → ratio=0.75 → 1 + 0.75*2 = 2.5x
+            且 missing==1 → +1.5 → 最终 4.0x
+        """
+        registry = registry or ClaimRegistry()
+        best = 1.0
+        ordered_products = {order_product(o) for o in ctx["pending_orders"]}
+        for pzid in ctx["proc_zones"]:
+            pz = ctx["zones"][pzid]
+            if item not in pz.get("inputs", []):
+                continue
+            if not (set(pz.get("outputs", [])) & ordered_products):
+                continue
+            current = pz.get("items", {}).get(item, 0)
+            in_transit = registry.material_in_transit(pzid, item)
+            if current + in_transit >= 1:
+                continue
+            inputs = pz.get("inputs", [])
+            have = sum(1 for inp in inputs
+                       if pz.get("items", {}).get(inp, 0) +
+                          registry.material_in_transit(pzid, inp) >= 1)
+            missing = len(inputs) - have
+            ratio = have / len(inputs) if inputs else 0
+            multiplier = 1.0 + ratio * 2.0
+            if missing == 1:
+                multiplier += self.CHAIN_LAST_PIECE_BONUS
+            if multiplier > best:
+                best = multiplier
+        return best
+
+    # ================================================================
+    # 拥堵感知分配
+    # ================================================================
+
+    def _zone_congestion(self, zone_id: str) -> int:
+        """统计当前正在前往该区的车辆数。"""
+        if not zone_id:
+            return 0
+        count = 0
+        for active in self.memory.active_tasks.values():
+            if active.task.target_zone == zone_id:
+                count += 1
+        return count
+
+    def _compute_commands(self, ctx: dict) -> dict:
+        """V3 全局贪心 + 拥堵感知轻微惩罚（平局决胜）。"""
+        registry = ClaimRegistry.from_memory(self.memory, ctx["vehicles"])
+        self._augment_registry(registry, ctx)
+        commands: dict = {}
+
+        if ctx["pending_orders"]:
+            self._abandon_low_priority_tasks(ctx, commands)
+
+        idle_vehicles = []
+        for vid in sorted(ctx["vehicles"], key=vehicle_sort_key):
+            vehicle = ctx["vehicles"][vid]
+            if vehicle.get("status") != "idle":
+                continue
+            candidates = self._gen_candidates(vehicle, ctx, registry)
+            if candidates:
+                idle_vehicles.append((vid, vehicle, candidates))
+
+        if idle_vehicles:
+            scored_pairs = []
+            task_pool: dict[tuple, Task] = {}
+            for vi, (vid, vehicle, candidates) in enumerate(idle_vehicles):
+                pos = vehicle.get("position")
+                for task in candidates:
+                    key = self._task_key(task)
+                    if key not in task_pool:
+                        task_pool[key] = task
+                    dist = self._zone_distance(pos, task.target_zone or "")
+                    # 拥堵惩罚：每个已前往该区的车 -10 分
+                    congestion = self._zone_congestion(task.target_zone or "")
+                    score = (task.priority
+                             - dist * V2Strategy.PICK_DISTANCE_WEIGHT
+                             - congestion * self.CONGESTION_PENALTY)
+                    scored_pairs.append((score, vi, key))
+
+            scored_pairs.sort(key=lambda x: x[0], reverse=True)
+            assigned: set[int] = set()
+            claimed: set[tuple] = set()
+            for score, vi, key in scored_pairs:
+                if vi in assigned or key in claimed:
+                    continue
+                task = task_pool[key]
+                if not registry.can_claim(task):
+                    continue
+                vid, vehicle, _ = idle_vehicles[vi]
+                if not self._target_zone_available(
+                    vehicle.get("position"), task.target_zone or "", ctx, task
+                ):
+                    continue
+                cmd = self._build_command(vehicle, task, ctx,
+                                          vehicle_id=vid, registry=registry)
+                if not cmd:
+                    continue
+                registry.claim(task)
+                self.memory.active_tasks[vid] = ActiveTask(
+                    vehicle_id=vid, task=task, assigned_at=ctx["time"],
+                    start_carrying=vehicle.get("carrying"),
+                )
+                commands[vid] = cmd
+                assigned.add(vi)
+                claimed.add(key)
+                self.logger.log_command(ctx, vid, cmd, task=task, source="v31_greedy")
+
+            # 未分配车辆前馈补料
+            for vi, (vid, vehicle, _) in enumerate(idle_vehicles):
+                if vi in assigned:
+                    continue
+                pos = vehicle.get("position")
+                task = V3Strategy._choose_forward_fill_task(self, pos, ctx, registry)
+                if task and registry.can_claim(task):
+                    cmd = self._build_command(vehicle, task, ctx,
+                                              vehicle_id=vid, registry=registry)
+                    if cmd:
+                        registry.claim(task)
+                        self.memory.active_tasks[vid] = ActiveTask(
+                            vehicle_id=vid, task=task, assigned_at=ctx["time"],
+                            start_carrying=vehicle.get("carrying"),
+                        )
+                        commands[vid] = cmd
+                        self.logger.log_command(ctx, vid, cmd, task=task, source="v31_ff")
+
+        return commands
+
+
+class V3_2Strategy(V3_1Strategy):
+    """V3_2: V3_1 + 匈牙利全局最优匹配。
+
+    当空闲车辆数 × 统一任务池大小 ≤ HUNGARIAN_MAX_OPS 时，
+    使用匈牙利算法求全局最优匹配（而非贪心）。
+
+    匈牙利保证：不会有"v1 抢了 v2 更合适的任务"。
+    适用场景：空闲车辆少、任务候选少的中后期（前期任务多时自动退化为贪心）。
+    """
+
+    HUNGARIAN_MAX_OPS = 300  # n*m ≤ 300 时启用匈牙利（约 10车×30任务）
+
+    def _compute_commands(self, ctx: dict) -> dict:
+        registry = ClaimRegistry.from_memory(self.memory, ctx["vehicles"])
+        self._augment_registry(registry, ctx)
+        commands: dict = {}
+
+        if ctx["pending_orders"]:
+            self._abandon_low_priority_tasks(ctx, commands)
+
+        idle_vehicles = []
+        for vid in sorted(ctx["vehicles"], key=vehicle_sort_key):
+            vehicle = ctx["vehicles"][vid]
+            if vehicle.get("status") != "idle":
+                continue
+            candidates = self._gen_candidates(vehicle, ctx, registry)
+            if candidates:
+                idle_vehicles.append((vid, vehicle, candidates))
+
+        if idle_vehicles:
+            # 构建统一任务池
+            task_pool: dict[tuple, Task] = {}
+            for _vid, _vehicle, candidates in idle_vehicles:
+                for task in candidates:
+                    key = self._task_key(task)
+                    if key not in task_pool:
+                        task_pool[key] = task
+
+            task_list = list(task_pool.values())
+            n_vehicles = len(idle_vehicles)
+            n_tasks = len(task_list)
+            ops = n_vehicles * n_tasks
+
+            if ops <= self.HUNGARIAN_MAX_OPS and n_tasks > 0:
+                assigned = self._hungarian_assign(
+                    idle_vehicles, task_list, task_pool, ctx, registry, commands
+                )
+            else:
+                assigned = set()
+
+            # 贪心分配（匈牙利未启用的车，或匈牙利回退）
+            if len(assigned) < n_vehicles:
+                self._greedy_assign(
+                    idle_vehicles, task_pool, ctx, registry, commands, assigned
+                )
+
+            # 未分配车辆前馈补料
+            for vi, (vid, vehicle, _) in enumerate(idle_vehicles):
+                if vi in assigned:
+                    continue
+                pos = vehicle.get("position")
+                task = V3Strategy._choose_forward_fill_task(self, pos, ctx, registry)
+                if task and registry.can_claim(task):
+                    cmd = self._build_command(vehicle, task, ctx,
+                                              vehicle_id=vid, registry=registry)
+                    if cmd:
+                        registry.claim(task)
+                        self.memory.active_tasks[vid] = ActiveTask(
+                            vehicle_id=vid, task=task, assigned_at=ctx["time"],
+                            start_carrying=vehicle.get("carrying"),
+                        )
+                        commands[vid] = cmd
+                        self.logger.log_command(ctx, vid, cmd, task=task, source="v32_ff")
+
+        return commands
+
+    # ================================================================
+    # 匈牙利全局最优匹配
+    # ================================================================
+
+    def _hungarian_assign(self, idle_vehicles, task_list, task_pool,
+                           ctx, registry, commands) -> set:
+        """匈牙利算法全局最优匹配。返回已分配的 vehicle indices。"""
+        n = len(idle_vehicles)
+        m = len(task_list)
+        INF = 1e9
+
+        # 构建代价矩阵（n × m）：cost = -score
+        cost = [[INF] * m for _ in range(n)]
+        for i, (vid, vehicle, candidates) in enumerate(idle_vehicles):
+            pos = vehicle.get("position")
+            candidate_keys = {self._task_key(t) for t in candidates}
+            for j, task in enumerate(task_list):
+                key = self._task_key(task)
+                if key not in candidate_keys:
+                    continue
+                dist = self._zone_distance(pos, task.target_zone or "")
+                congestion = self._zone_congestion(task.target_zone or "")
+                score = (task.priority
+                         - dist * V2Strategy.PICK_DISTANCE_WEIGHT
+                         - congestion * V3_1Strategy.CONGESTION_PENALTY)
+                cost[i][j] = -score  # 匈牙利求最小代价，所以取负
+
+        # 匈牙利算法
+        assignment = hungarian_assign(cost)
+
+        assigned = set()
+        for i, j in enumerate(assignment):
+            if j < 0 or j >= m:
+                continue
+            task = task_list[j]
+            key = self._task_key(task)
+            if not registry.can_claim(task):
+                continue
+            vid, vehicle, _ = idle_vehicles[i]
+            if not self._target_zone_available(
+                vehicle.get("position"), task.target_zone or "", ctx, task
+            ):
+                continue
+            # 只接受正收益的分配
+            dist = self._zone_distance(vehicle.get("position"), task.target_zone or "")
+            score = task.priority - dist * V2Strategy.PICK_DISTANCE_WEIGHT
+            if score < 0:
+                continue
+            cmd = self._build_command(vehicle, task, ctx, vehicle_id=vid, registry=registry)
+            if not cmd:
+                continue
+            registry.claim(task)
+            self.memory.active_tasks[vid] = ActiveTask(
+                vehicle_id=vid, task=task, assigned_at=ctx["time"],
+                start_carrying=vehicle.get("carrying"),
+            )
+            commands[vid] = cmd
+            assigned.add(i)
+            self.logger.log_command(ctx, vid, cmd, task=task, source="v32_hungarian")
+
+        return assigned
+
+    # ================================================================
+    # 贪心回退
+    # ================================================================
+
+    def _greedy_assign(self, idle_vehicles, task_pool, ctx, registry, commands, assigned):
+        """V3_1 风格的贪心分配（用于匈牙利未覆盖的车辆）。"""
+        scored_pairs = []
+        for vi, (vid, vehicle, candidates) in enumerate(idle_vehicles):
+            if vi in assigned:
+                continue
+            pos = vehicle.get("position")
+            for task in candidates:
+                key = self._task_key(task)
+                dist = self._zone_distance(pos, task.target_zone or "")
+                congestion = self._zone_congestion(task.target_zone or "")
+                score = (task.priority
+                         - dist * V2Strategy.PICK_DISTANCE_WEIGHT
+                         - congestion * V3_1Strategy.CONGESTION_PENALTY)
+                scored_pairs.append((score, vi, key))
+
+        scored_pairs.sort(key=lambda x: x[0], reverse=True)
+        claimed = set()
+        for score, vi, key in scored_pairs:
+            if vi in assigned or key in claimed:
+                continue
+            task = task_pool[key]
+            if not registry.can_claim(task):
+                continue
+            vid, vehicle, _ = idle_vehicles[vi]
+            if not self._target_zone_available(
+                vehicle.get("position"), task.target_zone or "", ctx, task
+            ):
+                continue
+            cmd = self._build_command(vehicle, task, ctx, vehicle_id=vid, registry=registry)
+            if not cmd:
+                continue
+            registry.claim(task)
+            self.memory.active_tasks[vid] = ActiveTask(
+                vehicle_id=vid, task=task, assigned_at=ctx["time"],
+                start_carrying=vehicle.get("carrying"),
+            )
+            commands[vid] = cmd
+            assigned.add(vi)
+            claimed.add(key)
+            self.logger.log_command(ctx, vid, cmd, task=task, source="v32_greedy")
+
+
+class V4Strategy(V2Strategy):
     """V4：检测近距离车辆，低收益车避让重规划。"""
 
     COLLISION_WARN_DISTANCE = 3.5

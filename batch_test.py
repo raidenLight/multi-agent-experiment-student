@@ -55,26 +55,29 @@ def kill_existing_server():
                         os.kill(int(pid), 9)
         except Exception:
             pass
-    time.sleep(1)
+    time.sleep(3)  # Increased from 1s to 3s for Windows TIME_WAIT
 
 
 # ======================================================================
 # 单次测试
 # ======================================================================
 
-async def run_one(version_file: str, seed: int) -> dict:
+async def run_one(version_file: str, seed: int, speed: int = SPEED) -> dict:
     """运行一次测试，返回 {seed, score, file}。"""
     print(f"  seed={seed} ...", end=" ", flush=True)
 
-    # 杀掉旧进程
+    # Use fixed recording port (cleaned by kill_existing_server)
+    rec_port = RECORDING_PORT
+
+    # 杀掉旧进程 (cleans both PORT and RECORDING_PORT)
     kill_existing_server()
 
     # 1. 启动 server
     server = subprocess.Popen(
         [sys.executable, str(PROJECT_DIR / "server" / "game_server.py"),
          "--port", str(PORT),
-         "--recording-port", str(RECORDING_PORT),
-         "--speed", str(SPEED),
+         "--recording-port", str(rec_port),
+         "--speed", str(speed),
          "--seed", str(seed)],
         cwd=str(PROJECT_DIR),
         stdout=subprocess.DEVNULL,
@@ -132,10 +135,17 @@ async def run_one(version_file: str, seed: int) -> dict:
                         line.split("Final score:")[-1].strip())
                 except ValueError:
                     pass
-        print(f"{metrics['score']:.0f}pts", end=" ", flush=True)
+        score_str = f"{metrics['score']:.0f}" if metrics['score'] is not None else "???"
+        print(f"{score_str}pts", end=" ", flush=True)
 
     except Exception as e:
-        print(f"ERR({type(e).__name__})", end=" ")
+        import traceback
+        print(f"ERR({type(e).__name__}: {e})", end=" ")
+        # Check if server died
+        if server.poll() is not None:
+            _, err = server.communicate()
+            if err:
+                print(f" [server: {err.decode(errors='replace')[:150]}]", end=" ")
         student.kill()
 
     server.kill()
