@@ -1,6 +1,0 @@
-=== V1 协同供应链策略 ===
-连接到: ws://localhost:8765
-策略：V0 贪心 + target_zone + claimed/in_transit 目标占用
-等待游戏开始...
-[SDK] Connected to ws://localhost:8765
-[SDK] Graph loaded: 0 nodes
