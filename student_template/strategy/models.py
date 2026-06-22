@@ -68,6 +68,9 @@ class StrategyMemory:
     last_clearance_time: dict[str, float] = field(default_factory=dict)
     reserved_clearance_nodes: set[str] = field(default_factory=set)
     reserved_staging_nodes: set[str] = field(default_factory=set)
+    reserved_predispatch_nodes: set[str] = field(default_factory=set)
+    last_predispatch_time: dict[str, float] = field(default_factory=dict)
+    last_predispatch_node: dict[str, str] = field(default_factory=dict)
     close_pair_counts: dict[tuple[str, str], int] = field(default_factory=dict)
     close_pair_first_seen: dict[tuple[str, str], float] = field(default_factory=dict)
     close_pair_last_seen: dict[tuple[str, str], float] = field(default_factory=dict)
@@ -98,6 +101,11 @@ class StrategyMemory:
         for vid in list(self.last_clearance_time):
             if vid not in vehicles:
                 self.last_clearance_time.pop(vid, None)
+
+        for vid in list(self.last_predispatch_time):
+            if vid not in vehicles:
+                self.last_predispatch_time.pop(vid, None)
+                self.last_predispatch_node.pop(vid, None)
 
         for vid in list(self.deferred_tasks):
             if vid not in vehicles:
