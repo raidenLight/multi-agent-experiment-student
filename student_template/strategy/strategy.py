@@ -450,16 +450,21 @@ class V3Strategy(V2Strategy):
 # ======================================================================
 
 class V4Strategy(V3Strategy):
-    """V4：检测近距离车辆，低收益车避让重规划。"""
+    """V4：合法锚点避让 + 低扰动持续冲突处理。"""
 
     COLLISION_WARN_DISTANCE = 3.5
     IDLE_CLEAR_DISTANCE = 2.0
-    CLEARANCE_SPEED = 12.0
+    CLEARANCE_SPEED = 16.0
     REPLAN_COOLDOWN_SECONDS = 1.0
-    CLEARANCE_COOLDOWN_SECONDS = 0.4
+    CLEARANCE_COOLDOWN_SECONDS = 2.5
     EXPECTED_GAIN_WEIGHT = 0.03
     RANDOM_REPLAN_PROB = 0.15
     BLOCK_LOOKAHEAD = 3
+    SUSTAINED_CONFLICT_SECONDS = 1.2
+    SUSTAINED_CONFLICT_TICKS = 2
+    DETOUR_RATIO_LIMIT = 1.25
+    SAME_DIRECTION_SPEED = 8.0
+    TARGET_STAGING_DISTANCE = 2.0
     V4_EVENT_LOG_INTERVAL = 1.0
     DEFAULT_RAW_REWARD = 30.0
     DEFAULT_PRODUCT_REWARD = 100.0
@@ -468,6 +473,9 @@ class V4Strategy(V3Strategy):
     CONGESTION_FUTURE_PENALTY = 18.0
     CONGESTION_TARGET_PENALTY = 25.0
     EMERGENCY_KEEPER_STATUS_BONUS = 8.0
+    PREDISPATCH_SPEED = 18.0
+    PREDISPATCH_HOLD_SECONDS = 8.0
+    PREDISPATCH_MIN_DISTANCE = 6.0
 
     def __init__(self, sdk) -> None:
         super().__init__(sdk)
@@ -479,12 +487,44 @@ class V4Strategy(V3Strategy):
             os.environ.get("V4_CONGESTION_PATH", "0").lower()
             in {"1", "true", "yes", "on"}
         )
+        self.avoidance_enabled = (
+            os.environ.get("V4_AVOIDANCE", "1").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.moving_replan_enabled = (
+            os.environ.get("V4_MOVING_REPLAN", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.target_staging_enabled = (
+            os.environ.get("V4_TARGET_STAGING", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.predispatch_enabled = (
+            os.environ.get("V4_PREDISPATCH", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.parallel_raw_pick_enabled = (
+            os.environ.get("V4_PARALLEL_RAW_PICK", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.abandon_stale_raw_enabled = (
+            os.environ.get("V4_ABANDON_STALE_RAW", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.same_direction_stagger_enabled = (
+            os.environ.get("V4_SAME_DIRECTION_STAGGER", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.CLEARANCE_SPEED = self._env_float("V4_CLEARANCE_SPEED", self.CLEARANCE_SPEED)
+        self.PREDISPATCH_SPEED = self._env_float("V4_PREDISPATCH_SPEED", self.PREDISPATCH_SPEED)
         self.REPLAN_COOLDOWN_SECONDS = self._env_float(
             "V4_REPLAN_COOLDOWN", self.REPLAN_COOLDOWN_SECONDS
         )
         self.COLLISION_WARN_DISTANCE = self._env_float(
             "V4_WARN_DISTANCE", self.COLLISION_WARN_DISTANCE
+        )
+        self.DETOUR_RATIO_LIMIT = self._env_float(
+            "V4_DETOUR_RATIO", self.DETOUR_RATIO_LIMIT
         )
 
     @staticmethod
@@ -500,27 +540,163 @@ class V4Strategy(V3Strategy):
         ctx = self._prepare(state)
         self.memory.prune(ctx["vehicles"], ctx["time"], self.STALE_TASK_SECONDS)
         self.memory.reserved_clearance_nodes.clear()
+        self.memory.reserved_staging_nodes.clear()
+        self.memory.reserved_predispatch_nodes.clear()
         commands = self._compute_commands(ctx)
-        commands.update(self._build_replan_overrides(ctx, commands))
+        if self.avoidance_enabled:
+            commands.update(self._build_replan_overrides(ctx, commands))
         self._update_last_nodes(ctx)
         self.logger.log_snapshot(state, self.memory)
         return commands
+
+    def _compute_commands(self, ctx: dict) -> dict:
+        """V4 adds no-action pre-dispatch after normal task assignment fails."""
+        registry = ClaimRegistry.from_memory(self.memory, ctx["vehicles"])
+        self._augment_registry(registry, ctx)
+        commands = {}
+
+        for vid in sorted(ctx["vehicles"], key=vehicle_sort_key):
+            vehicle = ctx["vehicles"][vid]
+            if vehicle.get("status") != "idle":
+                continue
+
+            task = self._choose_task(vid, vehicle, ctx, registry)
+            if task:
+                command = self._build_command(
+                    vehicle, task, ctx, vehicle_id=vid, registry=registry
+                )
+                if command:
+                    registry.claim(task)
+                    self.memory.active_tasks[vid] = ActiveTask(
+                        vehicle_id=vid, task=task,
+                        assigned_at=ctx["time"],
+                        start_carrying=vehicle.get("carrying"),
+                    )
+                    commands[vid] = command
+                    self.logger.log_command(ctx, vid, command, task=task)
+                    continue
+
+            command = self._build_predispatch_command(vid, vehicle, ctx, registry)
+            if command:
+                commands[vid] = command
+
+        return commands
+
+    def _choose_empty_vehicle_task(self, pos: list, ctx: dict,
+                                   registry: ClaimRegistry) -> Optional[Task]:
+        task = super()._choose_empty_vehicle_task(pos, ctx, registry)
+        if task or not self.parallel_raw_pick_enabled:
+            return task
+        return self._choose_parallel_raw_pick_task(pos, ctx, registry)
+
+    def _choose_task(self, vehicle_id: str, vehicle: dict,
+                     ctx: dict, registry: ClaimRegistry) -> Optional[Task]:
+        task = super()._choose_task(vehicle_id, vehicle, ctx, registry)
+        if task or not self.abandon_stale_raw_enabled:
+            return task
+
+        carrying = vehicle.get("carrying")
+        if carrying in ctx.get("raw_items", set()) and self._raw_item_has_no_pending_use(carrying, ctx):
+            return Task(
+                kind=TaskKind.ABANDON,
+                item=carrying,
+                priority=-1.0,
+                reason=f"丢弃当前订单不需要的原料 {carrying}",
+            )
+        return None
+
+    def _raw_item_has_no_pending_use(self, item: str, ctx: dict) -> bool:
+        pending_products = {order_product(order) for order in ctx.get("pending_orders", [])}
+        if not pending_products:
+            return True
+        for zid in ctx["proc_zones"]:
+            zone = ctx["zones"][zid]
+            product = (zone.get("outputs") or [None])[0]
+            if product in pending_products and item in zone.get("inputs", []):
+                return False
+        return True
+
+    def _choose_parallel_raw_pick_task(self, pos: list, ctx: dict,
+                                       registry: ClaimRegistry) -> Optional[Task]:
+        """Use the second raw-material stock when multiple downstream slots need it.
+
+        V3 treats a raw zone as single-claim even though raw zones can hold two
+        items. This keeps some empty vehicles idle while one vehicle heads to a
+        source with enough inventory for another useful pickup.
+        """
+        pressures = self._pending_product_pressures(ctx)
+        if not pressures:
+            return None
+
+        candidates = []
+        for rzid in ctx["raw_zones"]:
+            raw_zone = ctx["zones"][rzid]
+            outputs = raw_zone.get("outputs", [])
+            if not outputs:
+                continue
+            item = outputs[0]
+            stock = raw_zone.get("items", {}).get(item, 0)
+            claimed = registry.raw_pick_count(rzid)
+            if not raw_zone.get("ready") or stock <= claimed:
+                continue
+
+            missing_pressure = 0.0
+            missing_slots = 0
+            for pzid in ctx["proc_zones"]:
+                proc_zone = ctx["zones"][pzid]
+                if item not in proc_zone.get("inputs", []):
+                    continue
+                product = (proc_zone.get("outputs") or [None])[0]
+                pressure = pressures.get(product or "", 0.0)
+                if pressure <= 0:
+                    continue
+                if proc_zone.get("items", {}).get(item, 0) + registry.material_in_transit(pzid, item) >= 1:
+                    continue
+                missing_slots += 1
+                missing_pressure += pressure
+
+            if missing_slots <= claimed:
+                continue
+
+            dist = self._zone_distance(pos, rzid)
+            scarcity = self._material_scarcity(item, ctx)
+            score = missing_pressure * 0.35 + scarcity * 12.0 - dist * 0.08
+            task = Task(
+                kind=TaskKind.PICK_RAW,
+                item=item,
+                pick_zone=rzid,
+                priority=score,
+                reason=f"并行预取原料 {item}",
+            )
+            candidates.append((score, -dist, rzid, task))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        return candidates[0][3]
 
     def _build_command(self, vehicle: dict, task: Task,
                        ctx: dict = None, vehicle_id: str = None,
                        registry: ClaimRegistry = None) -> Optional[dict]:
         if task.kind in {TaskKind.WAIT, TaskKind.ABANDON}:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
-        if not self.congestion_path_enabled:
-            return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
 
         target_zone = task.target_zone
         action_type = task.action_type
-        if not target_zone or not action_type or not self.sdk or not ctx:
+        if not target_zone or not action_type:
+            return None
+        if not self.sdk or not ctx:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
 
-        start_pos = vehicle.get("position")
-        start = self._node_from_position(start_pos)
+        if self.avoidance_enabled and self.target_staging_enabled:
+            staging = self._target_staging_command(vehicle, task, ctx, vehicle_id)
+            if staging:
+                return staging
+
+        if not self.congestion_path_enabled:
+            return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
+
+        start, _prefix = self._legal_anchor(vehicle)
         end = self.sdk.get_zone_node(target_zone)
         if not start or not end:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
@@ -530,11 +706,14 @@ class V4Strategy(V3Strategy):
         if not path:
             return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
 
-        command = {
-            "path": self.sdk.nodes_to_points(path),
-            "action": {"type": action_type, "target_zone": target_zone},
-            "speed": self.CRUISE_SPEED,
-        }
+        command = self._command_from_node_path(
+            vehicle,
+            path,
+            {"type": action_type, "target_zone": target_zone},
+            self.CRUISE_SPEED,
+        )
+        if not command:
+            return super()._build_command(vehicle, task, ctx, vehicle_id, registry)
         self.logger.log_event_throttled(
             "v4_congestion_path",
             key=(vehicle_id, target_zone, tuple(path[:4]), tuple(sorted(penalties.items())[:6])),
@@ -546,6 +725,265 @@ class V4Strategy(V3Strategy):
             path_distance=round(self.sdk.path_distance(path), 3),
         )
         return command
+
+    def _build_predispatch_command(self, vehicle_id: str, vehicle: dict,
+                                   ctx: dict, registry: ClaimRegistry) -> Optional[dict]:
+        if not self.predispatch_enabled or not self.sdk:
+            return None
+
+        start, _prefix = self._legal_anchor(vehicle)
+        if not start:
+            return None
+
+        current_node = self._node_from_position(vehicle.get("position"))
+        last_node = self.memory.last_predispatch_node.get(vehicle_id)
+        last_time = self.memory.last_predispatch_time.get(vehicle_id, -1e9)
+        if (current_node and current_node == last_node
+                and ctx["time"] - last_time < self.PREDISPATCH_HOLD_SECONDS):
+            return None
+
+        candidates = self._predispatch_candidates(vehicle_id, vehicle, ctx, registry)
+        for score, target_node, target_zone, mode, reason in candidates:
+            if start == target_node:
+                self.memory.last_predispatch_time[vehicle_id] = ctx["time"]
+                self.memory.last_predispatch_node[vehicle_id] = target_node
+                continue
+
+            node_path = self.sdk.plan_path(start, target_node)
+            if not node_path or len(node_path) < 2:
+                continue
+            distance = self.sdk.path_distance(node_path)
+            if distance < self.PREDISPATCH_MIN_DISTANCE:
+                continue
+
+            command = self._command_from_node_path(
+                vehicle, node_path, None, self.PREDISPATCH_SPEED
+            )
+            if not command:
+                continue
+
+            self.memory.reserved_predispatch_nodes.add(target_node)
+            self.memory.last_predispatch_time[vehicle_id] = ctx["time"]
+            self.memory.last_predispatch_node[vehicle_id] = target_node
+            self.logger.log_event_throttled(
+                "v4_predispatch",
+                key=(vehicle_id, target_node, mode, reason),
+                min_interval=self.V4_EVENT_LOG_INTERVAL,
+                state_or_ctx=ctx,
+                vehicle_id=vehicle_id,
+                mode=mode,
+                target_zone=target_zone,
+                target_node=target_node,
+                carrying=vehicle.get("carrying"),
+                score=round(score, 3),
+                reason=reason,
+                path_nodes=node_path,
+                path_distance=round(distance, 3),
+            )
+            self.logger.log_command(ctx, vehicle_id, command, source="v4_predispatch")
+            return command
+
+        return None
+
+    def _predispatch_candidates(self, vehicle_id: str, vehicle: dict,
+                                ctx: dict, registry: ClaimRegistry
+                                ) -> list[tuple[float, str, str, str, str]]:
+        pos = vehicle.get("position")
+        if not pos:
+            return []
+
+        pressures = self._pending_product_pressures(ctx)
+        if not pressures:
+            return []
+
+        carrying = vehicle.get("carrying")
+        if carrying:
+            # Carrying vehicles wait for a real drop assignment. Experiments
+            # showed that staging them near processing entrances creates
+            # congestion and starves the order pipeline.
+            return []
+
+        candidates = []
+        candidates.extend(self._empty_product_predispatch_candidates(
+            vehicle_id, pos, ctx, pressures
+        ))
+        candidates.extend(self._empty_raw_predispatch_candidates(
+            vehicle_id, pos, ctx, registry, pressures
+        ))
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        return candidates
+
+    def _raw_carry_predispatch_candidates(
+            self, vehicle_id: str, item: str, pos: list, ctx: dict,
+            registry: ClaimRegistry, pressures: dict[str, float]
+            ) -> list[tuple[float, str, str, str, str]]:
+        candidates = []
+        for zid in ctx["proc_zones"]:
+            zone = ctx["zones"][zid]
+            if item not in zone.get("inputs", []):
+                continue
+            product = (zone.get("outputs") or [None])[0]
+            pressure = pressures.get(product or "", 0.0)
+            if pressure <= 0:
+                continue
+
+            target_node = self.sdk.get_zone_node(zid)
+            staging = self._predispatch_staging_node(target_node, ctx, vehicle_id)
+            if not staging:
+                continue
+
+            current = zone.get("items", {}).get(item, 0)
+            in_transit = registry.material_in_transit(zid, item)
+            slot_bonus = 55.0 if current + in_transit < 1 else 15.0
+            product_value = self._product_value(product or "")
+            distance = self._zone_distance(pos, zid)
+            score = (
+                120.0 + slot_bonus + product_value * 0.35
+                + pressure * 0.12 - distance * 0.08
+            )
+            reason = "carry_raw_slot" if current + in_transit < 1 else "carry_raw_future"
+            candidates.append((score, staging, zid, "carry_raw", reason))
+
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        return candidates
+
+    def _product_carry_predispatch_candidates(
+            self, vehicle_id: str, product: str, pos: list, ctx: dict,
+            pressures: dict[str, float]) -> list[tuple[float, str, str, str, str]]:
+        candidates = []
+        for order in self._sorted_orders(ctx):
+            if order_product(order) != product:
+                continue
+            consumer = order_consumer(order)
+            if not consumer:
+                continue
+            target_node = self.sdk.get_zone_node(consumer)
+            staging = self._predispatch_staging_node(target_node, ctx, vehicle_id)
+            if not staging:
+                continue
+            distance = self._zone_distance(pos, consumer)
+            score = 180.0 + pressures.get(product, 0.0) * 0.2 - distance * 0.1
+            candidates.append((score, staging, consumer, "carry_product", "pending_order"))
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        return candidates
+
+    def _empty_product_predispatch_candidates(
+            self, vehicle_id: str, pos: list, ctx: dict,
+            pressures: dict[str, float]) -> list[tuple[float, str, str, str, str]]:
+        candidates = []
+        for zid in ctx["proc_zones"]:
+            zone = ctx["zones"][zid]
+            product = (zone.get("outputs") or [None])[0]
+            pressure = pressures.get(product or "", 0.0)
+            if pressure <= 0:
+                continue
+            progress = float(zone.get("progress") or 0.0)
+            if not zone.get("ready") and progress <= 0:
+                continue
+
+            target_node = self.sdk.get_zone_node(zid)
+            staging = self._predispatch_staging_node(target_node, ctx, vehicle_id)
+            if not staging:
+                continue
+
+            ready_bonus = 45.0 if zone.get("ready") else 0.0
+            distance = self._zone_distance(pos, zid)
+            score = (
+                55.0 + ready_bonus + self._product_value(product or "") * 0.25
+                + pressure * 0.1 + progress * 0.2 - distance * 0.08
+            )
+            reason = "product_ready_claimed" if zone.get("ready") else "product_soon"
+            candidates.append((score, staging, zid, "empty_product", reason))
+
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        return candidates
+
+    def _empty_raw_predispatch_candidates(
+            self, vehicle_id: str, pos: list, ctx: dict,
+            registry: ClaimRegistry, pressures: dict[str, float]
+            ) -> list[tuple[float, str, str, str, str]]:
+        candidates = []
+        needed_items: dict[str, float] = {}
+        for zid in ctx["proc_zones"]:
+            zone = ctx["zones"][zid]
+            product = (zone.get("outputs") or [None])[0]
+            pressure = pressures.get(product or "", 0.0)
+            if pressure <= 0:
+                continue
+            for item in zone.get("inputs", []):
+                if zone.get("items", {}).get(item, 0) + registry.material_in_transit(zid, item) >= 1:
+                    continue
+                needed_items[item] = max(needed_items.get(item, 0.0), pressure)
+
+        for rzid in ctx["raw_zones"]:
+            zone = ctx["zones"][rzid]
+            outputs = zone.get("outputs", [])
+            if not outputs:
+                continue
+            item = outputs[0]
+            pressure = needed_items.get(item, 0.0)
+            if pressure <= 0:
+                continue
+            if registry.raw_pick_zones and rzid in registry.raw_pick_zones and not zone.get("ready"):
+                # Another vehicle is already heading to the same not-yet-ready source.
+                continue
+
+            target_node = self.sdk.get_zone_node(rzid)
+            staging = self._predispatch_staging_node(target_node, ctx, vehicle_id)
+            if not staging:
+                continue
+            stock = sum(zone.get("items", {}).values())
+            ready_bonus = 25.0 if zone.get("ready") or stock > 0 else 0.0
+            progress = float(zone.get("progress") or 0.0)
+            distance = self._zone_distance(pos, rzid)
+            score = (
+                35.0 + ready_bonus + pressure * 0.12
+                + self._material_scarcity(item, ctx) * 8.0
+                + progress * 0.1 - distance * 0.06
+            )
+            reason = "raw_ready_claimed" if zone.get("ready") else "raw_soon"
+            candidates.append((score, staging, rzid, "empty_raw", reason))
+
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        return candidates
+
+    def _pending_product_pressures(self, ctx: dict) -> dict[str, float]:
+        pressures: dict[str, float] = {}
+        for order in ctx.get("pending_orders", []):
+            product = order_product(order)
+            if not product:
+                continue
+            pressures[product] = pressures.get(product, 0.0) + self._order_priority(ctx, order)
+        return pressures
+
+    def _predispatch_staging_node(self, target_node: str | None, ctx: dict,
+                                  vehicle_id: str | None) -> Optional[str]:
+        if not target_node:
+            return None
+        staging = self._staging_node_for_target(target_node, ctx, vehicle_id)
+        if staging:
+            return staging
+
+        occupied = self._predispatch_occupied_nodes(ctx, vehicle_id)
+        if target_node not in occupied:
+            return target_node
+        return None
+
+    def _predispatch_occupied_nodes(self, ctx: dict, vehicle_id: str | None) -> set[str]:
+        occupied = set(self.memory.reserved_clearance_nodes)
+        occupied.update(self.memory.reserved_staging_nodes)
+        occupied.update(self.memory.reserved_predispatch_nodes)
+        for other, vehicle in ctx.get("vehicles", {}).items():
+            if other == vehicle_id:
+                continue
+            node = self._node_from_position(vehicle.get("position"))
+            if node:
+                occupied.add(node)
+            for point in (vehicle.get("path_preview") or [])[:1]:
+                next_node = self._node_from_position(point)
+                if next_node:
+                    occupied.add(next_node)
+        return occupied
 
     def _validate_task(self, task: Optional[Task], vehicle: dict,
                        ctx: dict) -> Optional[Task]:
@@ -598,6 +1036,8 @@ class V4Strategy(V3Strategy):
                     continue
 
                 direction = self._direction_relation(a, b, cache)
+                pair_memory = self._update_conflict_memory(a, b, ctx, cache)
+                sustained = self._is_sustained_conflict(pair_memory)
                 cooldown_age_a = self._cooldown_age(a, ctx)
                 cooldown_age_b = self._cooldown_age(b, ctx)
                 self.logger.log_event_throttled(
@@ -619,6 +1059,9 @@ class V4Strategy(V3Strategy):
                     current_node_b=cache[b]["current_node"],
                     next_node_a=cache[a]["next_node"],
                     next_node_b=cache[b]["next_node"],
+                    conflict_count=pair_memory["count"],
+                    conflict_age=round(pair_memory["age"], 3),
+                    sustained=sustained,
                 )
 
                 if self._distance(cache[a]["pos"], cache[b]["pos"]) <= self.IDLE_CLEAR_DISTANCE:
@@ -632,19 +1075,42 @@ class V4Strategy(V3Strategy):
                             overrides[clearance_vid] = cmd
                             replanned.add(clearance_vid)
                             self.memory.last_replan_time[clearance_vid] = ctx["time"]
+                            self.memory.last_clearance_time[clearance_vid] = ctx["time"]
                             continue
 
-                if direction == "same_direction":
-                    follower = self._choose_replanner(a, b, ctx, expected_gains, cache)
+                if not sustained:
+                    self._log_replan_skip(
+                        "v4_replan_skip",
+                        ctx,
+                        a=a,
+                        b=b,
+                        reason="not_sustained_conflict",
+                        direction=direction,
+                    )
+                    continue
+
+                if direction == "same_direction" and self.same_direction_stagger_enabled:
+                    follower = self._choose_same_direction_follower(a, b, ctx, expected_gains, cache)
                     if follower and follower not in replanned:
                         active = self.memory.active_tasks.get(follower)
-                        if active:
-                            cmd = self._speed_stagger_vehicle(follower, b if follower == a else a, ctx, active.task)
+                        if not active:
+                            cmd = self._speed_stagger_no_task_vehicle(follower, b if follower == a else a, ctx)
                             if cmd:
                                 overrides[follower] = cmd
                                 replanned.add(follower)
                                 self.memory.last_replan_time[follower] = ctx["time"]
                                 continue
+
+                if not self.moving_replan_enabled:
+                    self._log_replan_skip(
+                        "v4_replan_skip",
+                        ctx,
+                        a=a,
+                        b=b,
+                        reason="moving_replan_disabled",
+                        direction=direction,
+                    )
+                    continue
 
                 replanner = self._choose_replanner(a, b, ctx, expected_gains, cache)
                 if not replanner:
@@ -682,6 +1148,8 @@ class V4Strategy(V3Strategy):
             reserved_before = set(reserved)
             for vid in sorted(group, key=vehicle_sort_key):
                 if vid == keeper:
+                    continue
+                if ctx["vehicles"].get(vid, {}).get("status") != "idle":
                     continue
                 target = self._safe_neighbor_node(
                     vid, ctx, cache,
@@ -753,6 +1221,34 @@ class V4Strategy(V3Strategy):
         dist = self._distance(cache[a]["pos"], cache[b]["pos"])
         return dist < self.IDLE_CLEAR_DISTANCE
 
+    def _update_conflict_memory(self, a: str, b: str, ctx: dict,
+                                cache: dict[str, dict]) -> dict[str, float | int]:
+        pair = self._pair_key(a, b)
+        now = ctx["time"]
+        last_seen = self.memory.close_pair_last_seen.get(pair, -1e9)
+        if now - last_seen > self.SUSTAINED_CONFLICT_SECONDS:
+            count = 1
+            first_seen = now
+        else:
+            count = self.memory.close_pair_counts.get(pair, 0) + 1
+            first_seen = self.memory.close_pair_first_seen.get(pair, now)
+        self.memory.close_pair_counts[pair] = count
+        self.memory.close_pair_first_seen[pair] = first_seen
+        self.memory.close_pair_last_seen[pair] = now
+
+        for vid in pair:
+            node = cache.get(vid, {}).get("current_node")
+            if node:
+                self.memory.hot_nodes[node] = now
+
+        return {"count": count, "age": now - first_seen}
+
+    def _is_sustained_conflict(self, pair_memory: dict[str, float | int]) -> bool:
+        return (
+            int(pair_memory.get("count", 0)) >= self.SUSTAINED_CONFLICT_TICKS
+            or float(pair_memory.get("age", 0.0)) >= self.SUSTAINED_CONFLICT_SECONDS
+        )
+
     def _choose_emergency_keeper(self, group: set[str], ctx: dict,
                                  expected_gains: dict[str, float]) -> str:
         def key(vid: str) -> tuple[float, int, int, int]:
@@ -792,6 +1288,95 @@ class V4Strategy(V3Strategy):
         if not pos or not self.sdk:
             return None
         return self.sdk.find_nearest_node(pos[0], pos[1])
+
+    def _legal_anchor(self, vehicle: dict) -> tuple[Optional[str], list[list[float]]]:
+        """Return the graph node where a new route may legally branch.
+
+        If the vehicle is already moving, the only road-safe first segment is
+        continuing to the current path target. Branching from the nearest node
+        can create a visual shortcut across grass because the server moves
+        linearly between command path points.
+        """
+        pos = vehicle.get("position")
+        if not pos:
+            return None, []
+
+        preview = vehicle.get("path_preview") or []
+        if vehicle.get("status") == "moving" and preview:
+            anchor_point = preview[0]
+            anchor_node = self._node_from_position(anchor_point)
+            if not anchor_node:
+                return None, []
+            if self._points_close(pos, anchor_point):
+                return anchor_node, [anchor_point]
+            return anchor_node, [pos, anchor_point]
+
+        anchor_node = self._node_from_position(pos)
+        if not anchor_node:
+            return None, []
+        node_points = self.sdk.nodes_to_points([anchor_node])
+        if node_points and not self._points_close(pos, node_points[0]):
+            return anchor_node, [pos, node_points[0]]
+        return anchor_node, node_points or [pos]
+
+    def _command_from_node_path(
+            self,
+            vehicle: dict,
+            node_path: list[str],
+            action: dict | None,
+            speed: float) -> Optional[dict]:
+        if not node_path or not self._is_legal_node_path(node_path):
+            return None
+
+        anchor_node, prefix = self._legal_anchor(vehicle)
+        if not anchor_node:
+            return None
+
+        if node_path[0] != anchor_node:
+            node_path = [anchor_node] + node_path
+        if not self._is_legal_node_path(node_path):
+            return None
+
+        suffix = self.sdk.nodes_to_points(node_path)
+        points = self._merge_points(prefix, suffix)
+        if len(points) < 2:
+            return None
+        return {"path": points, "action": action, "speed": speed}
+
+    def _anchored_preview_path(self, vehicle: dict) -> list[list[float]]:
+        pos = vehicle.get("position")
+        preview = vehicle.get("path_preview") or []
+        if not pos or not preview:
+            return []
+        return self._merge_points([pos], preview)
+
+    def _is_legal_node_path(self, node_path: list[str]) -> bool:
+        if len(node_path) < 2:
+            return True
+        for left, right in zip(node_path, node_path[1:]):
+            if left == right:
+                continue
+            neighbors = {n for n, _weight in self.sdk._adjacency.get(left, [])}
+            if right not in neighbors:
+                return False
+        return True
+
+    def _merge_points(self, first: list[list[float]],
+                      second: list[list[float]]) -> list[list[float]]:
+        points: list[list[float]] = []
+        for point in (first or []) + (second or []):
+            if not point:
+                continue
+            if points and self._points_close(points[-1], point):
+                continue
+            points.append([float(point[0]), float(point[1])])
+        return points
+
+    @staticmethod
+    def _points_close(a: list, b: list, eps: float = 1e-6) -> bool:
+        if not a or not b:
+            return False
+        return abs(a[0] - b[0]) <= eps and abs(a[1] - b[1]) <= eps
 
     def _congestion_penalties(self, ctx: dict, vehicle_id: str | None,
                               end_node: str | None) -> dict[str, float]:
@@ -873,6 +1458,113 @@ class V4Strategy(V3Strategy):
                 return False
         return True
 
+    def _target_staging_command(self, vehicle: dict, task: Task, ctx: dict,
+                                vehicle_id: str | None) -> Optional[dict]:
+        target_zone = task.target_zone
+        if not target_zone or not self.sdk:
+            return None
+
+        zone = ctx.get("zones", {}).get(target_zone, {})
+        if zone.get("type") != "processing":
+            return None
+
+        zone_pos = self.sdk.get_zone_position(target_zone)
+        target_node = self.sdk.get_zone_node(target_zone)
+        pos = vehicle.get("position")
+        if not zone_pos or not target_node or not pos:
+            return None
+
+        # If the vehicle is already close enough, let the normal command carry
+        # the interaction action so pick/drop can complete.
+        if self._distance(pos, zone_pos) <= self.IDLE_CLEAR_DISTANCE:
+            return None
+        if not self._target_physically_busy(target_zone, target_node, ctx, vehicle_id):
+            return None
+
+        start, _prefix = self._legal_anchor(vehicle)
+        staging = self._staging_node_for_target(target_node, ctx, vehicle_id)
+        if not start or not staging:
+            return None
+        if start == staging:
+            return {"path": [], "action": None, "speed": 0.0}
+
+        node_path = self.sdk.plan_path(start, staging)
+        command = self._command_from_node_path(
+            vehicle, node_path, None, self.CRUISE_SPEED
+        ) if node_path else None
+        if not command:
+            return None
+
+        self.memory.reserved_staging_nodes.add(staging)
+        self.logger.log_event_throttled(
+            "v4_target_staging",
+            key=(vehicle_id, target_zone, staging),
+            min_interval=self.V4_EVENT_LOG_INTERVAL,
+            state_or_ctx=ctx,
+            vehicle_id=vehicle_id,
+            target_zone=target_zone,
+            target_node=target_node,
+            staging_node=staging,
+            task_kind=task.kind,
+        )
+        return command
+
+    def _target_physically_busy(self, target_zone: str, target_node: str,
+                                ctx: dict, vehicle_id: str | None) -> bool:
+        zone_pos = self.sdk.get_zone_position(target_zone)
+        if not zone_pos:
+            return False
+        for other, other_vehicle in ctx.get("vehicles", {}).items():
+            if other == vehicle_id:
+                continue
+            if other_vehicle.get("status") != "idle":
+                continue
+            other_pos = other_vehicle.get("position")
+            if not other_pos:
+                continue
+            other_node = self._node_from_position(other_pos)
+            if other_node == target_node and self._distance(other_pos, zone_pos) <= self.TARGET_STAGING_DISTANCE:
+                return True
+            if self._distance(other_pos, zone_pos) <= self.IDLE_CLEAR_DISTANCE:
+                return True
+        return False
+
+    def _staging_node_for_target(self, target_node: str, ctx: dict,
+                                 vehicle_id: str | None) -> Optional[str]:
+        occupied = set(self.memory.reserved_staging_nodes)
+        occupied.update(self.memory.reserved_clearance_nodes)
+        occupied.update(self.memory.reserved_predispatch_nodes)
+        for other, vehicle in ctx.get("vehicles", {}).items():
+            if other == vehicle_id:
+                continue
+            node = self._node_from_position(vehicle.get("position"))
+            if node:
+                occupied.add(node)
+            for point in (vehicle.get("path_preview") or [])[:1]:
+                next_node = self._node_from_position(point)
+                if next_node:
+                    occupied.add(next_node)
+
+        candidates = []
+        for neighbor, _weight in self.sdk._adjacency.get(target_node, []):
+            if neighbor in occupied or neighbor == target_node:
+                continue
+            point = self.sdk.nodes_to_points([neighbor])
+            if not point:
+                continue
+            distances = [
+                self._distance(point[0], v.get("position"))
+                for vid, v in ctx.get("vehicles", {}).items()
+                if vid != vehicle_id and v.get("position")
+            ]
+            min_dist = min(distances) if distances else float("inf")
+            hot_penalty = 5.0 if neighbor in self.memory.hot_nodes else 0.0
+            candidates.append((min_dist - hot_penalty, neighbor))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
     def _preview_next_node(self, vehicle: dict, current_node: Optional[str]) -> Optional[str]:
         preview = vehicle.get("path_preview", [])
         for point in preview:
@@ -923,6 +1615,8 @@ class V4Strategy(V3Strategy):
                 continue
             if cache.get(vid, {}).get("current_node") == cache.get(vid, {}).get("next_node"):
                 continue
+            if self._is_replan_protected(vid, ctx, cache, expected_gains):
+                continue
             candidates.append(vid)
 
         if not candidates:
@@ -934,6 +1628,44 @@ class V4Strategy(V3Strategy):
             return random.choice(candidates)
         return min(candidates, key=lambda vid: (expected_gains[vid], vid))
 
+    def _choose_same_direction_follower(self, a: str, b: str, ctx: dict,
+                                        expected_gains: dict[str, float],
+                                        cache: dict[str, dict]) -> Optional[str]:
+        candidates = []
+        for vid in (a, b):
+            vehicle = ctx["vehicles"].get(vid, {})
+            if vehicle.get("status") != "moving":
+                continue
+            if self._in_cooldown(vid, ctx):
+                continue
+            if cache.get(vid, {}).get("current_node") == cache.get(vid, {}).get("next_node"):
+                continue
+            active = self.memory.active_tasks.get(vid)
+            no_task_bonus = -50.0 if not active else 0.0
+            protected_bonus = 100.0 if active and self._is_replan_protected(vid, ctx, cache, expected_gains) else 0.0
+            candidates.append((expected_gains.get(vid, 0.0) + protected_bonus + no_task_bonus, vid))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    def _is_replan_protected(self, vid: str, ctx: dict, cache: dict[str, dict],
+                             expected_gains: dict[str, float]) -> bool:
+        vehicle = ctx["vehicles"].get(vid, {})
+        active = self.memory.active_tasks.get(vid)
+        task = active.task if active else None
+        carrying = vehicle.get("carrying")
+        if carrying in ctx.get("prod_items", set()):
+            return True
+        if task and task.kind in {TaskKind.DROP_PRODUCT, TaskKind.PICK_PRODUCT}:
+            return True
+        if task and task.target_zone:
+            zone_pos = self.sdk.get_zone_position(task.target_zone)
+            pos = cache.get(vid, {}).get("pos")
+            if zone_pos and pos and self._distance(pos, zone_pos) <= self.COLLISION_WARN_DISTANCE:
+                return True
+        return expected_gains.get(vid, 0.0) >= self.DEFAULT_PRODUCT_REWARD
+
     def _choose_idle_clearance_vehicle(self, a: str, b: str, ctx: dict,
                                        cache: dict[str, dict],
                                        expected_gains: dict[str, float],
@@ -944,6 +1676,8 @@ class V4Strategy(V3Strategy):
             if vehicle.get("status") != "idle":
                 continue
             if self._in_cooldown(vid, ctx):
+                continue
+            if ctx["time"] - self.memory.last_clearance_time.get(vid, -1e9) < self.CLEARANCE_COOLDOWN_SECONDS:
                 continue
             if not self._safe_neighbor_node(vid, ctx, cache):
                 continue
@@ -961,8 +1695,16 @@ class V4Strategy(V3Strategy):
     def _clearance_vehicle(self, vid: str, other: str, ctx: dict,
                            cache: dict[str, dict],
                            target_node: Optional[str] = None) -> Optional[dict]:
-        start = cache.get(vid, {}).get("current_node")
-        target = target_node or self._safe_neighbor_node(vid, ctx, cache)
+        vehicle = ctx["vehicles"].get(vid, {})
+        start, _prefix = self._legal_anchor(vehicle)
+        avoid_nodes = self._occupied_target_nodes(ctx)
+        target = target_node or self._safe_neighbor_node(
+            vid,
+            ctx,
+            cache,
+            reserved_nodes=self.memory.reserved_clearance_nodes,
+            avoid_nodes=avoid_nodes,
+        )
         if not start or not target:
             self._log_replan_skip(
                 "v4_replan_skip",
@@ -974,11 +1716,19 @@ class V4Strategy(V3Strategy):
             return None
 
         path = [start, target]
-        command = {
-            "path": self.sdk.nodes_to_points(path),
-            "action": None,
-            "speed": self.CLEARANCE_SPEED,
-        }
+        command = self._command_from_node_path(vehicle, path, None, self.CLEARANCE_SPEED)
+        if not command:
+            self._log_replan_skip(
+                "v4_replan_skip",
+                ctx,
+                vehicle_id=vid,
+                other_id=other,
+                reason="illegal_clearance_path",
+                start=start,
+                target=target,
+                path_nodes=path,
+            )
+            return None
         self.logger.log_event_throttled(
             "v4_replan",
             key=("idle_clearance", vid, other, start, target),
@@ -997,6 +1747,7 @@ class V4Strategy(V3Strategy):
             path_distance=round(self.sdk.path_distance(path), 3),
         )
         self.logger.log_command(ctx, vid, command, source="v4_idle_clearance")
+        self.memory.reserved_clearance_nodes.add(target)
         self.memory.active_tasks.pop(vid, None)
         return command
 
@@ -1039,7 +1790,7 @@ class V4Strategy(V3Strategy):
             )
             return None
 
-        start = cache[vid]["current_node"]
+        start, _prefix = self._legal_anchor(vehicle)
         end = self.sdk.get_zone_node(target_zone)
         if not start or not end:
             self._log_replan_skip(
@@ -1084,11 +1835,42 @@ class V4Strategy(V3Strategy):
 
         path = self.sdk.plan_path_with_blocked(start, end, blocked)
         if path and len(path) > 1:
-            command = {
-                "path": self.sdk.nodes_to_points(path),
-                "action": {"type": action_type, "target_zone": target_zone},
-                "speed": self.CRUISE_SPEED,
-            }
+            baseline = self.sdk.plan_path(start, end)
+            baseline_distance = self.sdk.path_distance(baseline) if baseline else float("inf")
+            path_distance = self.sdk.path_distance(path)
+            if baseline_distance > 0 and path_distance > baseline_distance * self.DETOUR_RATIO_LIMIT:
+                self._log_replan_skip(
+                    "v4_replan_skip",
+                    ctx,
+                    vehicle_id=vid,
+                    other_id=other,
+                    reason="detour_too_long",
+                    start=start,
+                    end=end,
+                    blocked_nodes=sorted(blocked),
+                    path_distance=round(path_distance, 3),
+                    baseline_distance=round(baseline_distance, 3),
+                    detour_ratio=round(path_distance / baseline_distance, 3),
+                )
+                return self._speed_stagger_vehicle(vid, other, ctx, task)
+            command = self._command_from_node_path(
+                vehicle,
+                path,
+                {"type": action_type, "target_zone": target_zone},
+                self.CRUISE_SPEED,
+            )
+            if not command:
+                self._log_replan_skip(
+                    "v4_replan_skip",
+                    ctx,
+                    vehicle_id=vid,
+                    other_id=other,
+                    reason="illegal_blocked_replan_path",
+                    start=start,
+                    end=end,
+                    path_nodes=path,
+                )
+                return self._speed_stagger_vehicle(vid, other, ctx, task)
             self.logger.log_event(
                 "v4_replan",
                 ctx,
@@ -1101,17 +1883,11 @@ class V4Strategy(V3Strategy):
                 start=start,
                 end=end,
                 path_nodes=path,
-                path_distance=round(self.sdk.path_distance(path), 3),
+                path_distance=round(path_distance, 3),
             )
             self.logger.log_command(ctx, vid, command, task=task, source="v4_replan")
             return command
 
-        command = self.sdk.navigate_to(
-            target_zone,
-            action={"type": action_type, "target_zone": target_zone},
-            from_position=vehicle.get("position"),
-            speed=self.CRUISE_SPEED,
-        )
         self.logger.log_event(
             "v4_replan",
             ctx,
@@ -1124,11 +1900,9 @@ class V4Strategy(V3Strategy):
             start=start,
             end=end,
             reason="blocked_path_unavailable",
-            path_distance=round(self.sdk.points_distance(command.get("path", [])), 3) if command else None,
+            path_distance=None,
         )
-        if command:
-            self.logger.log_command(ctx, vid, command, task=task, source="v4_replan_fallback")
-        return command
+        return self._speed_stagger_vehicle(vid, other, ctx, task)
 
     def _build_blocked_nodes(self, vid: str, other: str, ctx: dict,
                              cache: dict[str, dict]) -> set[str]:
@@ -1163,13 +1937,13 @@ class V4Strategy(V3Strategy):
     def _speed_stagger_vehicle(self, vid: str, other: str, ctx: dict,
                                task: Task) -> Optional[dict]:
         vehicle = ctx["vehicles"].get(vid, {})
-        path = vehicle.get("path_preview", [])
+        path = self._anchored_preview_path(vehicle)
         if not path:
             return None
         command = {
             "path": path,
             "action": {"type": task.action_type, "target_zone": task.target_zone},
-            "speed": self.CLEARANCE_SPEED,
+            "speed": self.SAME_DIRECTION_SPEED,
         }
         self.logger.log_event(
             "v4_replan",
@@ -1187,11 +1961,40 @@ class V4Strategy(V3Strategy):
         self.logger.log_command(ctx, vid, command, task=task, source="v4_speed_stagger")
         return command
 
+    def _speed_stagger_no_task_vehicle(self, vid: str, other: str,
+                                       ctx: dict) -> Optional[dict]:
+        vehicle = ctx["vehicles"].get(vid, {})
+        path = self._anchored_preview_path(vehicle)
+        if not path:
+            return None
+        command = {
+            "path": path,
+            "action": None,
+            "speed": self.SAME_DIRECTION_SPEED,
+        }
+        self.logger.log_event(
+            "v4_replan",
+            ctx,
+            vehicle_id=vid,
+            other_id=other,
+            target_zone=None,
+            action_type=None,
+            mode="speed_stagger_no_task",
+            fallback=True,
+            blocked_nodes=[],
+            reason="same_direction_no_active_task",
+            path_distance=round(self.sdk.points_distance(path), 3),
+        )
+        self.logger.log_command(ctx, vid, command, source="v4_speed_stagger")
+        return command
+
     def _safe_neighbor_node(self, vid: str, ctx: dict,
                             cache: dict[str, dict],
                             reserved_nodes: set[str] | None = None,
                             avoid_nodes: set[str] | None = None) -> Optional[str]:
-        current = cache.get(vid, {}).get("current_node")
+        vehicle = ctx["vehicles"].get(vid, {})
+        current, _prefix = self._legal_anchor(vehicle)
+        current = current or cache.get(vid, {}).get("current_node")
         if not current:
             return None
         reserved_nodes = reserved_nodes or set()
@@ -1213,7 +2016,8 @@ class V4Strategy(V3Strategy):
                 for other in cache
                 if other != vid
             )
-            candidates.append((min_dist, neighbor))
+            hot_penalty = 5.0 if neighbor in self.memory.hot_nodes else 0.0
+            candidates.append((min_dist - hot_penalty, neighbor))
         if not candidates:
             return None
         candidates.sort(reverse=True)

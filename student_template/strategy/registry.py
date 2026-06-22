@@ -10,6 +10,7 @@ class ClaimRegistry:
 
     def __init__(self) -> None:
         self.raw_pick_zones: set[str] = set()
+        self.raw_pick_counts: dict[str, int] = {}
         self.product_pick_zones: set[str] = set()
         self.product_orders: set[tuple[str, str]] = set()
         self.material_drops: set[tuple[str, str]] = set()
@@ -42,6 +43,7 @@ class ClaimRegistry:
     def claim(self, task: Task) -> None:
         if task.kind == TaskKind.PICK_RAW and task.pick_zone:
             self.raw_pick_zones.add(task.pick_zone)
+            self.raw_pick_counts[task.pick_zone] = self.raw_pick_counts.get(task.pick_zone, 0) + 1
         elif task.kind == TaskKind.PICK_PRODUCT and task.pick_zone:
             self.product_pick_zones.add(task.pick_zone)
             self.processing_target_zones.add(task.pick_zone)
@@ -53,3 +55,6 @@ class ClaimRegistry:
 
     def material_in_transit(self, zone_id: str, item: str) -> int:
         return 1 if (zone_id, item) in self.material_drops else 0
+
+    def raw_pick_count(self, zone_id: str) -> int:
+        return self.raw_pick_counts.get(zone_id, 0)
