@@ -212,7 +212,7 @@ def kill_existing_server() -> None:
                         os.kill(int(pid), 9)
         except Exception:
             pass
-    time.sleep(1)
+    time.sleep(2)
 
 
 def empty_metrics(version_file: str, seed: int, run_index: int) -> dict[str, Any]:

@@ -74,6 +74,53 @@ class StrategySDK(AgentSDK):
 
         return []
 
+    def plan_path_with_edge_penalty(
+            self,
+            start_node: str,
+            end_node: str,
+            edge_penalties: Mapping[tuple, float] = None) -> list[str]:
+        """规划带边惩罚的路径。edge_penalties: {(from_node, to_node): penalty}
+
+        遍历边 u→v 时若 (u,v) 在 edge_penalties 中，则累加对应惩罚。
+        用于实现单向通行：对逆向边施加惩罚，引导车辆沿指定方向行驶。
+        """
+        if start_node == end_node:
+            return [start_node]
+
+        edge_penalties = edge_penalties or {}
+        dist = {start_node: 0.0}
+        prev = {start_node: None}
+        heap = [(0.0, start_node)]
+        visited = set()
+
+        import heapq
+
+        while heap:
+            d, u = heapq.heappop(heap)
+            if u in visited:
+                continue
+            visited.add(u)
+
+            if u == end_node:
+                path = []
+                node = end_node
+                while node is not None:
+                    path.append(node)
+                    node = prev[node]
+                return list(reversed(path))
+
+            for neighbor, weight in self._adjacency.get(u, []):
+                if neighbor in visited:
+                    continue
+                edge_penalty = float(edge_penalties.get((u, neighbor), 0.0))
+                new_dist = d + weight + edge_penalty
+                if new_dist < dist.get(neighbor, float("inf")):
+                    dist[neighbor] = new_dist
+                    prev[neighbor] = u
+                    heapq.heappush(heap, (new_dist, neighbor))
+
+        return []
+
     def plan_path_with_blocked(
             self,
             start_node: str,

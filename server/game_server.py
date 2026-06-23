@@ -227,10 +227,14 @@ class GameServer:
         print(f"[Server] Recording files on http://{host}:{recording_port}")
         print("[Server] Waiting for student connection...")
 
-        http_server = await asyncio.start_server(
-            self.recorder.handle_http, host, recording_port
-        )
-        async with websockets.serve(self.handler, host, port, ping_interval=60, ping_timeout=120):
+        try:
+            http_server = await asyncio.start_server(
+                self.recorder.handle_http, host, recording_port
+            )
+        except OSError:
+            print(f"[Server] WARNING: Recording port {recording_port} in use, continuing without")
+            http_server = None
+        async with websockets.serve(self.handler, host, port, ping_interval=60, ping_timeout=120, reuse_address=True):
             await asyncio.Future()
 
 
